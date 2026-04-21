@@ -14,6 +14,7 @@ type AppResult<T> = Result<T, Box<dyn Error>>;
 struct Session {
     name: String,
     last_activity: u64,
+    pinned: bool,
     is_current: bool,
 }
 
@@ -23,7 +24,7 @@ struct App {
     top: usize,
     rows: usize,
     cols: usize,
-    order_file: PathBuf,
+    pin_file: PathBuf,
     tmux_socket_name: Option<String>,
     tmux_socket_path: Option<String>,
     status: String,
@@ -42,7 +43,8 @@ impl App {
     fn new() -> AppResult<Self> {
         let tmux_socket_name = env::var("TMUX_SOCKET_NAME").ok();
         let tmux_socket_path = env::var("TMUX_SOCKET_PATH").ok();
-        let order_file = order_file_path();
+        let pin_file = pin_file_path();
+        let pinned_names = read_pinned_names(&pin_file);
         let (rows, cols) = terminal_size().unwrap_or((24, 80));
         let current_session = tmux_output(
             &tmux_socket_name,
@@ -62,8 +64,9 @@ impl App {
             ],
         )?;
 
-        let mut sessions = parse_sessions(&raw_sessions, &current_session)?;
-        sync_sessions(&mut sessions, &order_file)?;
+        let mut sessions = parse_sessions(&raw_sessions, &current_session, &pinned_names)?;
+        arrange_sessions(&mut sessions, &pinned_names);
+        write_pinned_names(&pin_file, &pinned_names_from_sessions(&sessions))?;
 
         let selected = sessions
             .iter()
@@ -76,7 +79,7 @@ impl App {
             top: 0,
             rows,
             cols,
-            order_file,
+            pin_file,
             tmux_socket_name,
             tmux_socket_path,
             status: String::new(),
@@ -102,6 +105,7 @@ impl App {
                 b'k' => self.move_up(),
                 b'g' => self.jump_first(),
                 b'G' => self.jump_last(),
+                b'p' => self.toggle_pin()?,
                 b'J' => self.reorder_down()?,
                 b'K' => self.reorder_up()?,
                 b'\r' | b'\n' => {
@@ -142,28 +146,63 @@ impl App {
     }
 
     fn reorder_up(&mut self) -> AppResult<()> {
+        if !self.current().pinned {
+            self.status = "Pin session first".to_string();
+            return Ok(());
+        }
+
         if self.selected == 0 {
-            self.status = "Session is already first".to_string();
+            self.status = "Pinned session is already first".to_string();
             return Ok(());
         }
 
         self.sessions.swap(self.selected, self.selected - 1);
         self.selected -= 1;
-        self.write_order()?;
+        self.write_pins()?;
         self.status = format!("Moved {} up", self.current().name);
         Ok(())
     }
 
     fn reorder_down(&mut self) -> AppResult<()> {
-        if self.selected + 1 >= self.sessions.len() {
-            self.status = "Session is already last".to_string();
+        if !self.current().pinned {
+            self.status = "Pin session first".to_string();
+            return Ok(());
+        }
+
+        let pinned_count = self.pinned_count();
+        if self.selected + 1 >= pinned_count {
+            self.status = "Pinned session is already last".to_string();
             return Ok(());
         }
 
         self.sessions.swap(self.selected, self.selected + 1);
         self.selected += 1;
-        self.write_order()?;
+        self.write_pins()?;
         self.status = format!("Moved {} down", self.current().name);
+        Ok(())
+    }
+
+    fn toggle_pin(&mut self) -> AppResult<()> {
+        let current_name = self.current().name.clone();
+        let was_pinned = self.current().pinned;
+
+        if let Some(session) = self.sessions.get_mut(self.selected) {
+            session.pinned = !session.pinned;
+        }
+
+        let pinned_names = pinned_names_from_sessions(&self.sessions);
+        arrange_sessions(&mut self.sessions, &pinned_names);
+        self.selected = self
+            .sessions
+            .iter()
+            .position(|session| session.name == current_name)
+            .unwrap_or(0);
+        self.write_pins()?;
+        self.status = if was_pinned {
+            format!("Unpinned {current_name}")
+        } else {
+            format!("Pinned {current_name}")
+        };
         Ok(())
     }
 
@@ -179,6 +218,13 @@ impl App {
 
     fn current(&self) -> &Session {
         &self.sessions[self.selected]
+    }
+
+    fn pinned_count(&self) -> usize {
+        self.sessions
+            .iter()
+            .take_while(|session| session.pinned)
+            .count()
     }
 
     fn ensure_visible(&mut self) {
@@ -209,7 +255,7 @@ impl App {
             .unwrap_or(8);
         let min_name_width = 16;
         let activity_width = 4;
-        let fixed_width = 2 + min_name_width + 2 + activity_width + 2 + 3;
+        let fixed_width = 3 + min_name_width + 2 + activity_width + 2 + 3;
         let max_name_width = self
             .cols
             .saturating_sub(fixed_width)
@@ -303,14 +349,16 @@ impl App {
 
         if let Some(session) = self.sessions.get(session_index) {
             let pointer = if session_index == self.selected { ">" } else { " " };
+            let pin = if session.pinned { "!" } else { " " };
             let current = if session.is_current { "*" } else { "" };
             let last = format_relative_activity(session.last_activity);
             let line = format!(
-                "{} {:<name_width$}  {:>activity_width$}  {:^3}",
+                "{} {:<name_width$}  {:>activity_width$}  {:^3} {}",
                 pointer,
                 session.name,
                 last,
                 current,
+                pin,
                 name_width = layout.name_width,
                 activity_width = layout.activity_width,
             );
@@ -343,20 +391,8 @@ impl App {
         Ok(())
     }
 
-    fn write_order(&self) -> AppResult<()> {
-        if let Some(parent) = self.order_file.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let contents = self
-            .sessions
-            .iter()
-            .map(|session| session.name.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        fs::write(&self.order_file, format!("{contents}\n"))?;
-        Ok(())
+    fn write_pins(&self) -> AppResult<()> {
+        write_pinned_names(&self.pin_file, &pinned_names_from_sessions(&self.sessions))
     }
 }
 
@@ -390,13 +426,13 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn order_file_path() -> PathBuf {
-    if let Ok(path) = env::var("TMUX_SESSION_ORDER_FILE") {
+fn pin_file_path() -> PathBuf {
+    if let Ok(path) = env::var("TMUX_SESSION_PIN_FILE") {
         return PathBuf::from(path);
     }
 
     let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".config/tmux/session-order")
+    PathBuf::from(home).join(".config/tmux/session-pins")
 }
 
 fn tmux_output(
@@ -444,7 +480,11 @@ fn tmux_status(
     Ok(())
 }
 
-fn parse_sessions(raw: &str, current_session: &str) -> AppResult<Vec<Session>> {
+fn parse_sessions(
+    raw: &str,
+    current_session: &str,
+    pinned_names: &[String],
+) -> AppResult<Vec<Session>> {
     let mut sessions = Vec::new();
 
     for line in raw.lines() {
@@ -463,6 +503,7 @@ fn parse_sessions(raw: &str, current_session: &str) -> AppResult<Vec<Session>> {
         sessions.push(Session {
             name: name.clone(),
             last_activity,
+            pinned: pinned_names.iter().any(|pinned_name| pinned_name == &name),
             is_current: name == current_session,
         });
     }
@@ -474,44 +515,68 @@ fn parse_sessions(raw: &str, current_session: &str) -> AppResult<Vec<Session>> {
     Ok(sessions)
 }
 
-fn sync_sessions(sessions: &mut Vec<Session>, order_file: &PathBuf) -> AppResult<()> {
-    let mut ordered = Vec::with_capacity(sessions.len());
-    let mut remaining = sessions.clone();
-    let original_names = sessions
-        .iter()
-        .map(|session| session.name.clone())
-        .collect::<Vec<_>>();
+fn read_pinned_names(pin_file: &PathBuf) -> Vec<String> {
+    let Ok(contents) = fs::read_to_string(pin_file) else {
+        return Vec::new();
+    };
 
-    if let Ok(contents) = fs::read_to_string(order_file) {
-        for line in contents.lines().filter(|line| !line.is_empty()) {
-            if let Some(index) = remaining.iter().position(|session| session.name == line) {
-                ordered.push(remaining.remove(index));
-            }
+    let mut names = Vec::new();
+    for line in contents.lines().filter(|line| !line.is_empty()) {
+        if !names.iter().any(|name| name == line) {
+            names.push(line.to_string());
         }
     }
+    names
+}
 
-    remaining.sort_by(|a, b| a.name.cmp(&b.name));
-    ordered.extend(remaining);
-    *sessions = ordered;
-
-    if let Some(parent) = order_file.parent() {
+fn write_pinned_names(pin_file: &PathBuf, pinned_names: &[String]) -> AppResult<()> {
+    if let Some(parent) = pin_file.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let new_names = sessions
-        .iter()
-        .map(|session| session.name.clone())
-        .collect::<Vec<_>>();
-
-    if new_names != original_names || !order_file.exists() {
-        let contents = sessions
-            .iter()
-            .map(|session| session.name.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        fs::write(order_file, format!("{contents}\n"))?;
-    }
+    let contents = pinned_names.join("\n");
+    fs::write(pin_file, format!("{contents}\n"))?;
     Ok(())
+}
+
+fn pinned_names_from_sessions(sessions: &[Session]) -> Vec<String> {
+    sessions
+        .iter()
+        .filter(|session| session.pinned)
+        .map(|session| session.name.clone())
+        .collect()
+}
+
+fn arrange_sessions(sessions: &mut Vec<Session>, pinned_names: &[String]) {
+    let mut remaining = std::mem::take(sessions);
+    let mut pinned = Vec::with_capacity(remaining.len());
+    let mut unpinned = Vec::with_capacity(remaining.len());
+
+    for pinned_name in pinned_names {
+        if let Some(index) = remaining
+            .iter()
+            .position(|session| session.pinned && session.name == *pinned_name)
+        {
+            pinned.push(remaining.remove(index));
+        }
+    }
+
+    for session in remaining.drain(..) {
+        if session.pinned {
+            pinned.push(session);
+        } else {
+            unpinned.push(session);
+        }
+    }
+
+    unpinned.sort_by(|a, b| {
+        b.last_activity
+            .cmp(&a.last_activity)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    pinned.extend(unpinned);
+    *sessions = pinned;
 }
 
 fn terminal_size() -> AppResult<(usize, usize)> {
@@ -619,59 +684,70 @@ fn main() -> AppResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Session, format_relative_activity, sync_sessions};
+    use super::{
+        Session, arrange_sessions, format_relative_activity, pinned_names_from_sessions,
+        write_pinned_names,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn session(name: &str) -> Session {
+    fn session(name: &str, last_activity: u64, pinned: bool) -> Session {
         Session {
             name: name.to_string(),
-            last_activity: 0,
+            last_activity,
+            pinned,
             is_current: false,
         }
     }
 
-    fn temp_order_file() -> PathBuf {
+    fn temp_state_file(suffix: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("tmux-session-picker-test-{nanos}.order"))
+        std::env::temp_dir().join(format!("tmux-session-picker-test-{nanos}.{suffix}"))
     }
 
     #[test]
-    fn sync_sessions_keeps_existing_order_and_appends_new_names() {
-        let order_file = temp_order_file();
-        fs::write(&order_file, "dashboard\nconfig\n").unwrap();
-
-        let mut sessions = vec![session("doc"), session("config"), session("dashboard")];
-        sync_sessions(&mut sessions, &order_file).unwrap();
+    fn arrange_sessions_keeps_pinned_first_and_sorts_unpinned_by_activity() {
+        let mut sessions = vec![
+            session("pin-a", 5, true),
+            session("old", 10, false),
+            session("new", 100, false),
+            session("pin-b", 50, true),
+            session("mid", 50, false),
+        ];
+        let pinned_names = vec!["pin-b".to_string(), "pin-a".to_string()];
+        arrange_sessions(&mut sessions, &pinned_names);
 
         let names = sessions
             .iter()
             .map(|session| session.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["dashboard", "config", "doc"]);
-
-        let _ = fs::remove_file(order_file);
+        assert_eq!(names, vec!["pin-b", "pin-a", "new", "mid", "old"]);
     }
 
     #[test]
-    fn sync_sessions_discards_missing_names_from_order_file() {
-        let order_file = temp_order_file();
-        fs::write(&order_file, "missing\nconfig\n").unwrap();
+    fn pinned_names_follow_current_pinned_order() {
+        let sessions = vec![
+            session("pin-a", 0, true),
+            session("pin-b", 0, true),
+            session("free", 0, false),
+        ];
+        assert_eq!(
+            pinned_names_from_sessions(&sessions),
+            vec!["pin-a".to_string(), "pin-b".to_string()]
+        );
+    }
 
-        let mut sessions = vec![session("dashboard"), session("config")];
-        sync_sessions(&mut sessions, &order_file).unwrap();
-
-        let names = sessions
-            .iter()
-            .map(|session| session.name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(names, vec!["config", "dashboard"]);
-
-        let _ = fs::remove_file(order_file);
+    #[test]
+    fn write_pinned_names_creates_plain_line_file() {
+        let pin_file = temp_state_file("pins");
+        let pins = vec!["config".to_string(), "dashboard".to_string()];
+        write_pinned_names(&pin_file, &pins).unwrap();
+        assert_eq!(fs::read_to_string(&pin_file).unwrap(), "config\ndashboard\n");
+        let _ = fs::remove_file(pin_file);
     }
 
     #[test]
