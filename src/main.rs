@@ -29,6 +29,18 @@ struct App {
     status: String,
 }
 
+struct Layout {
+    title_row: usize,
+    title_col: usize,
+    header_row: usize,
+    table_col: usize,
+    index_width: usize,
+    name_width: usize,
+    list_row_start: usize,
+    blank_row: usize,
+    status_row: usize,
+}
+
 impl App {
     fn new() -> AppResult<Self> {
         let tmux_socket_name = env::var("TMUX_SOCKET_NAME").ok();
@@ -187,6 +199,63 @@ impl App {
         self.rows.saturating_sub(reserved_rows).max(1)
     }
 
+    fn visible_list_height(&self) -> usize {
+        self.viewport_height().min(self.sessions.len().max(1))
+    }
+
+    fn layout(&self) -> Layout {
+        let index_width = self.sessions.len().to_string().len().max(1);
+        let max_name_width = self
+            .sessions
+            .iter()
+            .map(|session| session.name.chars().count())
+            .max()
+            .unwrap_or(8);
+        let min_name_width = 16;
+        let fixed_width = 2 + index_width + 2 + 2 + 3 + 2 + 3 + 2 + 3;
+        let max_name_width = self
+            .cols
+            .saturating_sub(fixed_width)
+            .clamp(min_name_width, max_name_width.max(min_name_width));
+        let name_width = max_name_width.max(min_name_width).min(max_name_width);
+        let table_width = 2 + index_width + 2 + name_width + 2 + 3 + 2 + 3 + 2 + 3;
+        let list_height = self.visible_list_height();
+        let content_height = list_height + 5;
+        let top_padding = self.rows.saturating_sub(content_height);
+        let _table_width = table_width;
+        let table_col = 1;
+        let title_col = 1;
+        let title_row = top_padding + 1;
+        let header_row = title_row + 2;
+        let list_row_start = header_row + 1;
+        let blank_row = list_row_start + list_height;
+        let status_row = blank_row + 1;
+
+        Layout {
+            title_row,
+            title_col,
+            header_row,
+            table_col,
+            index_width,
+            name_width,
+            list_row_start,
+            blank_row,
+            status_row,
+        }
+    }
+
+    fn title_text(&self) -> String {
+        format!(
+            "Tmux sessions | current {} | {} total",
+            self.sessions
+                .iter()
+                .find(|session| session.is_current)
+                .map(|session| session.name.as_str())
+                .unwrap_or("-"),
+            self.sessions.len()
+        )
+    }
+
     fn render_full(&self) -> AppResult<()> {
         let mut stdout = io::stdout().lock();
         write!(stdout, "\x1b[H\x1b[2J")?;
@@ -223,39 +292,33 @@ impl App {
     }
 
     fn render_static(&self, stdout: &mut impl Write) -> AppResult<()> {
-        let title = format!(
-            "Tmux Sessions  current: {}  total: {}",
-            self.sessions
-                .iter()
-                .find(|session| session.is_current)
-                .map(|session| session.name.as_str())
-                .unwrap_or("-"),
-            self.sessions.len()
-        );
-        write_row(stdout, 1, &truncate(&title, self.cols), false)?;
-
-        let name_width = self
-            .sessions
-            .iter()
-            .map(|session| session.name.chars().count())
-            .max()
-            .unwrap_or(8)
-            .min(self.cols.saturating_sub(18).max(8));
+        let layout = self.layout();
+        let title = self.title_text();
+        write_at(stdout, layout.title_row, layout.title_col, &truncate(&title, self.cols), false)?;
+        write_row(stdout, layout.title_row + 1, "", false)?;
 
         let header = format!(
-            "   {:>2}  {:<name_width$}  {:>3}  {:>3}  cur",
+            "  {:>index_width$}  {:<name_width$}  {:>3}  {:>3}  {:^3}",
             "#",
             "session",
             "win",
             "cli",
-            name_width = name_width
+            "cur",
+            index_width = layout.index_width,
+            name_width = layout.name_width,
         );
-        write_row(stdout, 2, &truncate(&header, self.cols), false)?;
+        write_at(
+            stdout,
+            layout.header_row,
+            layout.table_col,
+            &truncate(&header, self.cols.saturating_sub(layout.table_col.saturating_sub(1))),
+            false,
+        )?;
         Ok(())
     }
 
     fn render_list_area(&self, stdout: &mut impl Write) -> AppResult<()> {
-        for visible_row in 0..self.viewport_height() {
+        for visible_row in 0..self.visible_list_height() {
             let session_index = self.top + visible_row;
             self.render_session_row_at(stdout, visible_row, session_index)?;
         }
@@ -277,31 +340,28 @@ impl App {
         visible_row: usize,
         session_index: usize,
     ) -> AppResult<()> {
-        let row = 3 + visible_row;
-
-        let name_width = self
-            .sessions
-            .iter()
-            .map(|session| session.name.chars().count())
-            .max()
-            .unwrap_or(8)
-            .min(self.cols.saturating_sub(18).max(8));
+        let layout = self.layout();
+        let row = layout.list_row_start + visible_row;
 
         if let Some(session) = self.sessions.get(session_index) {
             let pointer = if session_index == self.selected { ">" } else { " " };
-            let current = if session.is_current { "*" } else { " " };
+            let current = if session.is_current { "*" } else { "" };
             let line = format!(
-                "{} {:>2}  {:<name_width$}  {:>3}  {:>3}  {}",
+                "{} {:>index_width$}  {:<name_width$}  {:>3}  {:>3}  {:^3}",
                 pointer,
                 session_index + 1,
                 session.name,
                 session.windows,
                 session.attached_clients,
                 current,
-                name_width = name_width
+                index_width = layout.index_width,
+                name_width = layout.name_width,
             );
-            let line = truncate(&line, self.cols);
-            write_row(stdout, row, &line, session_index == self.selected)?;
+            let line = truncate(
+                &line,
+                self.cols.saturating_sub(layout.table_col.saturating_sub(1)),
+            );
+            write_at(stdout, row, layout.table_col, &line, session_index == self.selected)?;
         } else {
             write_row(stdout, row, "", false)?;
         }
@@ -309,11 +369,20 @@ impl App {
     }
 
     fn render_footer(&self, stdout: &mut impl Write) -> AppResult<()> {
-        let blank_row = 3 + self.viewport_height();
-        let status_row = blank_row + 1;
-        write_row(stdout, blank_row, "", false)?;
-        write_row(stdout, status_row, &truncate(&self.status, self.cols), false)?;
-        write!(stdout, "\x1b[{};1H\x1b[J", status_row + 1)?;
+        let layout = self.layout();
+        write_row(stdout, layout.blank_row, "", false)?;
+        if self.status.is_empty() {
+            write_row(stdout, layout.status_row, "", false)?;
+        } else {
+            write_at(
+                stdout,
+                layout.status_row,
+                1,
+                &truncate(&self.status, self.cols),
+                false,
+            )?;
+        }
+        write!(stdout, "\x1b[{};1H\x1b[J", layout.status_row + 1)?;
         Ok(())
     }
 
@@ -528,6 +597,22 @@ fn write_row(stdout: &mut impl Write, row: usize, text: &str, selected: bool) ->
         write!(stdout, "\x1b[7m{text}\x1b[0m")?;
     } else {
         write!(stdout, "{text}")?;
+    }
+    Ok(())
+}
+
+fn write_at(
+    stdout: &mut impl Write,
+    row: usize,
+    col: usize,
+    text: &str,
+    selected: bool,
+) -> io::Result<()> {
+    write!(stdout, "\x1b[{};1H\x1b[2K", row)?;
+    if selected {
+        write!(stdout, "\x1b[{};{}H\x1b[7m{text}\x1b[0m", row, col)?;
+    } else {
+        write!(stdout, "\x1b[{};{}H{text}", row, col)?;
     }
     Ok(())
 }
