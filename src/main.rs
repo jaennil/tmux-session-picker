@@ -6,14 +6,14 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 type AppResult<T> = Result<T, Box<dyn Error>>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Session {
     name: String,
-    windows: usize,
-    attached_clients: usize,
+    last_activity: u64,
     is_current: bool,
 }
 
@@ -30,12 +30,9 @@ struct App {
 }
 
 struct Layout {
-    title_row: usize,
-    title_col: usize,
-    header_row: usize,
     table_col: usize,
-    index_width: usize,
     name_width: usize,
+    activity_width: usize,
     list_row_start: usize,
     blank_row: usize,
     status_row: usize,
@@ -61,7 +58,7 @@ impl App {
             &[
                 "list-sessions",
                 "-F",
-                "#{session_name}\t#{session_windows}\t#{session_attached}",
+                "#{session_name}\t#{session_activity}",
             ],
         )?;
 
@@ -204,7 +201,6 @@ impl App {
     }
 
     fn layout(&self) -> Layout {
-        let index_width = self.sessions.len().to_string().len().max(1);
         let max_name_width = self
             .sessions
             .iter()
@@ -212,48 +208,31 @@ impl App {
             .max()
             .unwrap_or(8);
         let min_name_width = 16;
-        let fixed_width = 2 + index_width + 2 + 2 + 3 + 2 + 3 + 2 + 3;
+        let activity_width = 4;
+        let fixed_width = 2 + min_name_width + 2 + activity_width + 2 + 3;
         let max_name_width = self
             .cols
             .saturating_sub(fixed_width)
             .clamp(min_name_width, max_name_width.max(min_name_width));
         let name_width = max_name_width.max(min_name_width).min(max_name_width);
-        let table_width = 2 + index_width + 2 + name_width + 2 + 3 + 2 + 3 + 2 + 3;
+        let table_width = 2 + name_width + 2 + activity_width + 2 + 3;
         let list_height = self.visible_list_height();
-        let content_height = list_height + 5;
+        let content_height = list_height + 2;
         let top_padding = self.rows.saturating_sub(content_height);
         let _table_width = table_width;
         let table_col = 1;
-        let title_col = 1;
-        let title_row = top_padding + 1;
-        let header_row = title_row + 2;
-        let list_row_start = header_row + 1;
+        let list_row_start = top_padding + 1;
         let blank_row = list_row_start + list_height;
         let status_row = blank_row + 1;
 
         Layout {
-            title_row,
-            title_col,
-            header_row,
             table_col,
-            index_width,
             name_width,
+            activity_width,
             list_row_start,
             blank_row,
             status_row,
         }
-    }
-
-    fn title_text(&self) -> String {
-        format!(
-            "Tmux sessions | current {} | {} total",
-            self.sessions
-                .iter()
-                .find(|session| session.is_current)
-                .map(|session| session.name.as_str())
-                .unwrap_or("-"),
-            self.sessions.len()
-        )
     }
 
     fn render_full(&self) -> AppResult<()> {
@@ -292,28 +271,7 @@ impl App {
     }
 
     fn render_static(&self, stdout: &mut impl Write) -> AppResult<()> {
-        let layout = self.layout();
-        let title = self.title_text();
-        write_at(stdout, layout.title_row, layout.title_col, &truncate(&title, self.cols), false)?;
-        write_row(stdout, layout.title_row + 1, "", false)?;
-
-        let header = format!(
-            "  {:>index_width$}  {:<name_width$}  {:>3}  {:>3}  {:^3}",
-            "#",
-            "session",
-            "win",
-            "cli",
-            "cur",
-            index_width = layout.index_width,
-            name_width = layout.name_width,
-        );
-        write_at(
-            stdout,
-            layout.header_row,
-            layout.table_col,
-            &truncate(&header, self.cols.saturating_sub(layout.table_col.saturating_sub(1))),
-            false,
-        )?;
+        let _ = stdout;
         Ok(())
     }
 
@@ -346,16 +304,15 @@ impl App {
         if let Some(session) = self.sessions.get(session_index) {
             let pointer = if session_index == self.selected { ">" } else { " " };
             let current = if session.is_current { "*" } else { "" };
+            let last = format_relative_activity(session.last_activity);
             let line = format!(
-                "{} {:>index_width$}  {:<name_width$}  {:>3}  {:>3}  {:^3}",
+                "{} {:<name_width$}  {:>activity_width$}  {:^3}",
                 pointer,
-                session_index + 1,
                 session.name,
-                session.windows,
-                session.attached_clients,
+                last,
                 current,
-                index_width = layout.index_width,
                 name_width = layout.name_width,
+                activity_width = layout.activity_width,
             );
             let line = truncate(
                 &line,
@@ -497,21 +454,15 @@ fn parse_sessions(raw: &str, current_session: &str) -> AppResult<Vec<Session>> {
             continue;
         }
 
-        let windows = parts
+        let last_activity = parts
             .next()
             .unwrap_or("0")
-            .parse::<usize>()
-            .map_err(|err| format!("invalid windows count for {name}: {err}"))?;
-        let attached_clients = parts
-            .next()
-            .unwrap_or("0")
-            .parse::<usize>()
-            .map_err(|err| format!("invalid attached client count for {name}: {err}"))?;
+            .parse::<u64>()
+            .map_err(|err| format!("invalid last activity for {name}: {err}"))?;
 
         sessions.push(Session {
             name: name.clone(),
-            windows,
-            attached_clients,
+            last_activity,
             is_current: name == current_session,
         });
     }
@@ -591,6 +542,32 @@ fn truncate(text: &str, max_width: usize) -> String {
     result
 }
 
+fn format_relative_activity(timestamp: u64) -> String {
+    if timestamp == 0 {
+        return "-".to_string();
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(timestamp);
+
+    if now <= timestamp {
+        return "now".to_string();
+    }
+
+    let delta = now - timestamp;
+
+    match delta {
+        0..=4 => "now".to_string(),
+        5..=59 => format!("{delta}s"),
+        60..=3599 => format!("{}m", delta / 60),
+        3600..=86399 => format!("{}h", delta / 3600),
+        86400..=604799 => format!("{}d", delta / 86400),
+        _ => format!("{}w", delta / 604800),
+    }
+}
+
 fn write_row(stdout: &mut impl Write, row: usize, text: &str, selected: bool) -> io::Result<()> {
     write!(stdout, "\x1b[{};1H\x1b[2K", row)?;
     if selected {
@@ -642,7 +619,7 @@ fn main() -> AppResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Session, sync_sessions};
+    use super::{Session, format_relative_activity, sync_sessions};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -650,8 +627,7 @@ mod tests {
     fn session(name: &str) -> Session {
         Session {
             name: name.to_string(),
-            windows: 1,
-            attached_clients: 0,
+            last_activity: 0,
             is_current: false,
         }
     }
@@ -696,5 +672,19 @@ mod tests {
         assert_eq!(names, vec!["config", "dashboard"]);
 
         let _ = fs::remove_file(order_file);
+    }
+
+    #[test]
+    fn format_relative_activity_renders_short_age() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        assert_eq!(format_relative_activity(0), "-");
+        assert_eq!(format_relative_activity(now), "now");
+        assert_eq!(format_relative_activity(now.saturating_sub(12)), "12s");
+        assert_eq!(format_relative_activity(now.saturating_sub(180)), "3m");
+        assert_eq!(format_relative_activity(now.saturating_sub(7200)), "2h");
     }
 }
