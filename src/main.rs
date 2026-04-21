@@ -2,6 +2,8 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::mem::MaybeUninit;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -68,18 +70,22 @@ impl App {
             order_file,
             tmux_socket_name,
             tmux_socket_path,
-            status: "j/k move  J/K reorder  g/G first/last  Enter switch  q quit".to_string(),
+            status: String::new(),
         })
     }
 
     fn run(&mut self) -> AppResult<()> {
         self.ensure_visible();
-        self.render()?;
+        self.render_full()?;
 
         let mut stdin = io::stdin();
         let mut byte = [0_u8; 1];
 
         loop {
+            let previous_selected = self.selected;
+            let previous_top = self.top;
+            let previous_status = self.status.clone();
+
             stdin.read_exact(&mut byte)?;
 
             match byte[0] {
@@ -98,7 +104,7 @@ impl App {
             }
 
             self.ensure_visible();
-            self.render()?;
+            self.render_incremental(previous_selected, previous_top, &previous_status)?;
         }
 
         Ok(())
@@ -177,13 +183,46 @@ impl App {
     }
 
     fn viewport_height(&self) -> usize {
-        self.rows.saturating_sub(4).max(1)
+        let reserved_rows = 4;
+        self.rows.saturating_sub(reserved_rows).max(1)
     }
 
-    fn render(&self) -> AppResult<()> {
+    fn render_full(&self) -> AppResult<()> {
         let mut stdout = io::stdout().lock();
-        write!(stdout, "\x1b[2J\x1b[H")?;
+        write!(stdout, "\x1b[H\x1b[2J")?;
+        self.render_static(&mut stdout)?;
+        self.render_list_area(&mut stdout)?;
+        self.render_footer(&mut stdout)?;
+        stdout.flush()?;
+        Ok(())
+    }
 
+    fn render_incremental(
+        &self,
+        previous_selected: usize,
+        previous_top: usize,
+        previous_status: &str,
+    ) -> AppResult<()> {
+        let mut stdout = io::stdout().lock();
+
+        if previous_top != self.top {
+            self.render_list_area(&mut stdout)?;
+            self.render_footer(&mut stdout)?;
+        } else {
+            self.render_session_row(&mut stdout, previous_selected)?;
+            if previous_selected != self.selected {
+                self.render_session_row(&mut stdout, self.selected)?;
+            }
+            if previous_status != self.status {
+                self.render_footer(&mut stdout)?;
+            }
+        }
+
+        stdout.flush()?;
+        Ok(())
+    }
+
+    fn render_static(&self, stdout: &mut impl Write) -> AppResult<()> {
         let title = format!(
             "Tmux Sessions  current: {}  total: {}",
             self.sessions
@@ -193,15 +232,7 @@ impl App {
                 .unwrap_or("-"),
             self.sessions.len()
         );
-        write_line(&mut stdout, &truncate(&title, self.cols))?;
-        write_line(
-            &mut stdout,
-            &truncate(
-                "j/k navigate  J/K reorder  g/G first/last  Enter switch  q quit",
-                self.cols,
-            ),
-        )?;
-        write_line(&mut stdout, "")?;
+        write_row(stdout, 1, &truncate(&title, self.cols), false)?;
 
         let name_width = self
             .sessions
@@ -209,38 +240,80 @@ impl App {
             .map(|session| session.name.chars().count())
             .max()
             .unwrap_or(8)
-            .min(self.cols.saturating_sub(20).max(8));
+            .min(self.cols.saturating_sub(18).max(8));
 
-        for (index, session) in self
+        let header = format!(
+            "   {:>2}  {:<name_width$}  {:>3}  {:>3}  cur",
+            "#",
+            "session",
+            "win",
+            "cli",
+            name_width = name_width
+        );
+        write_row(stdout, 2, &truncate(&header, self.cols), false)?;
+        Ok(())
+    }
+
+    fn render_list_area(&self, stdout: &mut impl Write) -> AppResult<()> {
+        for visible_row in 0..self.viewport_height() {
+            let session_index = self.top + visible_row;
+            self.render_session_row_at(stdout, visible_row, session_index)?;
+        }
+        Ok(())
+    }
+
+    fn render_session_row(&self, stdout: &mut impl Write, session_index: usize) -> AppResult<()> {
+        if session_index < self.top || session_index >= self.top + self.viewport_height() {
+            return Ok(());
+        }
+
+        let visible_row = session_index - self.top;
+        self.render_session_row_at(stdout, visible_row, session_index)
+    }
+
+    fn render_session_row_at(
+        &self,
+        stdout: &mut impl Write,
+        visible_row: usize,
+        session_index: usize,
+    ) -> AppResult<()> {
+        let row = 3 + visible_row;
+
+        let name_width = self
             .sessions
             .iter()
-            .enumerate()
-            .skip(self.top)
-            .take(self.viewport_height())
-        {
-            let pointer = if index == self.selected { ">" } else { " " };
+            .map(|session| session.name.chars().count())
+            .max()
+            .unwrap_or(8)
+            .min(self.cols.saturating_sub(18).max(8));
+
+        if let Some(session) = self.sessions.get(session_index) {
+            let pointer = if session_index == self.selected { ">" } else { " " };
             let current = if session.is_current { "*" } else { " " };
             let line = format!(
-                "{} {:>2} {:<name_width$} {:>2}w {:>2}c {}",
+                "{} {:>2}  {:<name_width$}  {:>3}  {:>3}  {}",
                 pointer,
-                index + 1,
+                session_index + 1,
                 session.name,
                 session.windows,
                 session.attached_clients,
                 current,
                 name_width = name_width
             );
-            write_line(&mut stdout, &truncate(&line, self.cols))?;
+            let line = truncate(&line, self.cols);
+            write_row(stdout, row, &line, session_index == self.selected)?;
+        } else {
+            write_row(stdout, row, "", false)?;
         }
+        Ok(())
+    }
 
-        let used_rows = self.viewport_height().min(self.sessions.len().saturating_sub(self.top));
-        for _ in used_rows..self.viewport_height() {
-            write_line(&mut stdout, "")?;
-        }
-
-        write_line(&mut stdout, "")?;
-        write_line(&mut stdout, &truncate(&self.status, self.cols))?;
-        stdout.flush()?;
+    fn render_footer(&self, stdout: &mut impl Write) -> AppResult<()> {
+        let blank_row = 3 + self.viewport_height();
+        let status_row = blank_row + 1;
+        write_row(stdout, blank_row, "", false)?;
+        write_row(stdout, status_row, &truncate(&self.status, self.cols), false)?;
+        write!(stdout, "\x1b[{};1H\x1b[J", status_row + 1)?;
         Ok(())
     }
 
@@ -262,35 +335,29 @@ impl App {
 }
 
 struct TerminalGuard {
-    saved_state: String,
+    fd: RawFd,
+    saved_state: libc::termios,
 }
 
 impl TerminalGuard {
     fn enter() -> AppResult<Self> {
-        let saved_state = String::from_utf8(
-            Command::new("stty")
-                .arg("-g")
-                .output()?
-                .stdout,
-        )?;
-        let saved_state = saved_state.trim().to_string();
-
-        let status = Command::new("stty").args(["raw", "-echo"]).status()?;
-        if !status.success() {
-            return Err("failed to enter raw mode".into());
-        }
+        let fd = io::stdin().as_raw_fd();
+        let saved_state = get_termios(fd)?;
+        let mut raw_state = saved_state;
+        unsafe { libc::cfmakeraw(&mut raw_state) };
+        set_termios(fd, &raw_state)?;
 
         let mut stdout = io::stdout().lock();
         write!(stdout, "\x1b[?1049h\x1b[?25l")?;
         stdout.flush()?;
 
-        Ok(Self { saved_state })
+        Ok(Self { fd, saved_state })
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = Command::new("stty").arg(&self.saved_state).status();
+        let _ = set_termios(self.fd, &self.saved_state);
         let mut stdout = io::stdout().lock();
         let _ = write!(stdout, "\x1b[?25h\x1b[?1049l");
         let _ = stdout.flush();
@@ -390,6 +457,10 @@ fn parse_sessions(raw: &str, current_session: &str) -> AppResult<Vec<Session>> {
 fn sync_sessions(sessions: &mut Vec<Session>, order_file: &PathBuf) -> AppResult<()> {
     let mut ordered = Vec::with_capacity(sessions.len());
     let mut remaining = sessions.clone();
+    let original_names = sessions
+        .iter()
+        .map(|session| session.name.clone())
+        .collect::<Vec<_>>();
 
     if let Ok(contents) = fs::read_to_string(order_file) {
         for line in contents.lines().filter(|line| !line.is_empty()) {
@@ -407,25 +478,33 @@ fn sync_sessions(sessions: &mut Vec<Session>, order_file: &PathBuf) -> AppResult
         fs::create_dir_all(parent)?;
     }
 
-    let contents = sessions
+    let new_names = sessions
         .iter()
-        .map(|session| session.name.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    fs::write(order_file, format!("{contents}\n"))?;
+        .map(|session| session.name.clone())
+        .collect::<Vec<_>>();
+
+    if new_names != original_names || !order_file.exists() {
+        let contents = sessions
+            .iter()
+            .map(|session| session.name.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(order_file, format!("{contents}\n"))?;
+    }
     Ok(())
 }
 
 fn terminal_size() -> AppResult<(usize, usize)> {
-    let output = Command::new("stty").arg("size").output()?;
-    if !output.status.success() {
+    let fd = io::stdout().as_raw_fd();
+    let mut winsize = MaybeUninit::<libc::winsize>::zeroed();
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, winsize.as_mut_ptr()) };
+    if rc != 0 {
         return Err("failed to read terminal size".into());
     }
 
-    let size = String::from_utf8(output.stdout)?;
-    let mut parts = size.split_whitespace();
-    let rows = parts.next().unwrap_or("24").parse::<usize>()?;
-    let cols = parts.next().unwrap_or("80").parse::<usize>()?;
+    let winsize = unsafe { winsize.assume_init() };
+    let rows = usize::from(winsize.ws_row).max(1);
+    let cols = usize::from(winsize.ws_col).max(1);
     Ok((rows, cols))
 }
 
@@ -443,8 +522,31 @@ fn truncate(text: &str, max_width: usize) -> String {
     result
 }
 
-fn write_line(stdout: &mut impl Write, text: &str) -> io::Result<()> {
-    write!(stdout, "{text}\r\n")
+fn write_row(stdout: &mut impl Write, row: usize, text: &str, selected: bool) -> io::Result<()> {
+    write!(stdout, "\x1b[{};1H\x1b[2K", row)?;
+    if selected {
+        write!(stdout, "\x1b[7m{text}\x1b[0m")?;
+    } else {
+        write!(stdout, "{text}")?;
+    }
+    Ok(())
+}
+
+fn get_termios(fd: RawFd) -> AppResult<libc::termios> {
+    let mut termios = MaybeUninit::<libc::termios>::uninit();
+    let rc = unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) };
+    if rc != 0 {
+        return Err("failed to read terminal mode".into());
+    }
+    Ok(unsafe { termios.assume_init() })
+}
+
+fn set_termios(fd: RawFd, termios: &libc::termios) -> AppResult<()> {
+    let rc = unsafe { libc::tcsetattr(fd, libc::TCSANOW, termios) };
+    if rc != 0 {
+        return Err("failed to update terminal mode".into());
+    }
+    Ok(())
 }
 
 fn main() -> AppResult<()> {
