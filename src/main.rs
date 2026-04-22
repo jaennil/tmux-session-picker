@@ -44,29 +44,8 @@ impl App {
         let tmux_socket_name = env::var("TMUX_SOCKET_NAME").ok();
         let tmux_socket_path = env::var("TMUX_SOCKET_PATH").ok();
         let pin_file = pin_file_path();
-        let pinned_names = read_pinned_names(&pin_file);
         let (rows, cols) = terminal_size().unwrap_or((24, 80));
-        let current_session = tmux_output(
-            &tmux_socket_name,
-            &tmux_socket_path,
-            &["display-message", "-p", "#S"],
-        )?
-        .trim()
-        .to_string();
-
-        let raw_sessions = tmux_output(
-            &tmux_socket_name,
-            &tmux_socket_path,
-            &[
-                "list-sessions",
-                "-F",
-                "#{session_name}\t#{session_activity}",
-            ],
-        )?;
-
-        let mut sessions = parse_sessions(&raw_sessions, &current_session, &pinned_names)?;
-        arrange_sessions(&mut sessions, &pinned_names);
-        write_pinned_names(&pin_file, &pinned_names_from_sessions(&sessions))?;
+        let sessions = load_sessions(&pin_file, &tmux_socket_name, &tmux_socket_path)?;
 
         let selected = sessions
             .iter()
@@ -97,6 +76,7 @@ impl App {
             let previous_selected = self.selected;
             let previous_top = self.top;
             let previous_status = self.status.clone();
+            let mut redraw_full = false;
 
             stdin.read_exact(&mut byte)?;
 
@@ -105,7 +85,14 @@ impl App {
                 b'k' => self.move_up(),
                 b'g' => self.jump_first(),
                 b'G' => self.jump_last(),
-                b'p' => self.toggle_pin()?,
+                b'p' => {
+                    self.toggle_pin()?;
+                    redraw_full = true;
+                }
+                b'x' => {
+                    self.kill_selected()?;
+                    redraw_full = true;
+                }
                 b'J' => self.reorder_down()?,
                 b'K' => self.reorder_up()?,
                 b'\r' | b'\n' => {
@@ -117,7 +104,11 @@ impl App {
             }
 
             self.ensure_visible();
-            self.render_incremental(previous_selected, previous_top, &previous_status)?;
+            if redraw_full {
+                self.render_full()?;
+            } else {
+                self.render_incremental(previous_selected, previous_top, &previous_status)?;
+            }
         }
 
         Ok(())
@@ -203,6 +194,29 @@ impl App {
         } else {
             format!("Pinned {current_name}")
         };
+        Ok(())
+    }
+
+    fn kill_selected(&mut self) -> AppResult<()> {
+        if self.current().is_current {
+            self.status = "Cannot kill current session".to_string();
+            return Ok(());
+        }
+
+        let session_name = self.current().name.clone();
+        let next_selected_name = self
+            .sessions
+            .get(self.selected + 1)
+            .or_else(|| self.selected.checked_sub(1).and_then(|index| self.sessions.get(index)))
+            .map(|session| session.name.clone());
+        tmux_status(
+            &self.tmux_socket_name,
+            &self.tmux_socket_path,
+            &["kill-session", "-t", &session_name],
+        )?;
+
+        self.reload_sessions(next_selected_name.as_deref())?;
+        self.status = format!("Killed {session_name}");
         Ok(())
     }
 
@@ -394,6 +408,21 @@ impl App {
     fn write_pins(&self) -> AppResult<()> {
         write_pinned_names(&self.pin_file, &pinned_names_from_sessions(&self.sessions))
     }
+
+    fn reload_sessions(&mut self, preferred_name: Option<&str>) -> AppResult<()> {
+        let previous_selected = self.selected;
+        self.sessions = load_sessions(
+            &self.pin_file,
+            &self.tmux_socket_name,
+            &self.tmux_socket_path,
+        )?;
+        self.selected = preferred_name
+            .and_then(|name| self.sessions.iter().position(|session| session.name == name))
+            .or_else(|| self.sessions.iter().position(|session| session.is_current))
+            .unwrap_or_else(|| previous_selected.min(self.sessions.len().saturating_sub(1)));
+        self.top = self.top.min(self.selected);
+        Ok(())
+    }
 }
 
 struct TerminalGuard {
@@ -433,6 +462,27 @@ fn pin_file_path() -> PathBuf {
 
     let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".config/tmux/session-pins")
+}
+
+fn load_sessions(
+    pin_file: &PathBuf,
+    socket_name: &Option<String>,
+    socket_path: &Option<String>,
+) -> AppResult<Vec<Session>> {
+    let pinned_names = read_pinned_names(pin_file);
+    let current_session = tmux_output(socket_name, socket_path, &["display-message", "-p", "#S"])?
+        .trim()
+        .to_string();
+    let raw_sessions = tmux_output(
+        socket_name,
+        socket_path,
+        &["list-sessions", "-F", "#{session_name}\t#{session_activity}"],
+    )?;
+
+    let mut sessions = parse_sessions(&raw_sessions, &current_session, &pinned_names)?;
+    arrange_sessions(&mut sessions, &pinned_names);
+    write_pinned_names(pin_file, &pinned_names_from_sessions(&sessions))?;
+    Ok(sessions)
 }
 
 fn tmux_output(
