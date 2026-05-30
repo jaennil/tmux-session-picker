@@ -504,7 +504,7 @@ impl App {
                 stdout,
                 layout.status_row,
                 1,
-                &truncate(&format!("/{}{suffix}", self.query), self.cols),
+                &truncate(&format!("SEARCH /{}{suffix}", self.query), self.cols),
                 false,
             )?;
         } else if self.status.is_empty() {
