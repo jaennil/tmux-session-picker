@@ -28,6 +28,8 @@ struct App {
     tmux_socket_name: Option<String>,
     tmux_socket_path: Option<String>,
     status: String,
+    query: String,
+    searching: bool,
 }
 
 struct Layout {
@@ -62,6 +64,8 @@ impl App {
             tmux_socket_name,
             tmux_socket_path,
             status: String::new(),
+            query: String::new(),
+            searching: false,
         })
     }
 
@@ -80,11 +84,44 @@ impl App {
 
             stdin.read_exact(&mut byte)?;
 
+            if self.searching {
+                match byte[0] {
+                    b'\r' | b'\n' => {
+                        if self.has_matches() {
+                            self.switch_selected()?;
+                            break;
+                        }
+                    }
+                    0x1b => {
+                        self.query.clear();
+                        self.searching = false;
+                    }
+                    0x03 => break,
+                    0x7f | 0x08 => {
+                        self.query.pop();
+                        self.select_first_match();
+                    }
+                    value if value.is_ascii_graphic() || value == b' ' => {
+                        self.query.push(char::from(value));
+                        self.select_first_match();
+                    }
+                    _ => {}
+                }
+
+                self.ensure_visible();
+                self.render_full()?;
+                continue;
+            }
+
             match byte[0] {
                 b'j' => self.move_down(),
                 b'k' => self.move_up(),
                 b'g' => self.jump_first(),
                 b'G' => self.jump_last(),
+                b'/' => {
+                    self.searching = true;
+                    redraw_full = true;
+                }
                 b'p' => {
                     self.toggle_pin()?;
                     redraw_full = true;
@@ -115,25 +152,59 @@ impl App {
     }
 
     fn move_up(&mut self) {
-        if self.selected > 0 {
-            self.selected -= 1;
+        let matches = self.matching_indices();
+        if let Some(position) = matches.iter().position(|index| *index == self.selected) {
+            if position > 0 {
+                self.selected = matches[position - 1];
+            }
         }
     }
 
     fn move_down(&mut self) {
-        if self.selected + 1 < self.sessions.len() {
-            self.selected += 1;
+        let matches = self.matching_indices();
+        if let Some(position) = matches.iter().position(|index| *index == self.selected) {
+            if position + 1 < matches.len() {
+                self.selected = matches[position + 1];
+            }
         }
     }
 
     fn jump_first(&mut self) {
-        self.selected = 0;
+        if let Some(index) = self.matching_indices().first() {
+            self.selected = *index;
+        }
     }
 
     fn jump_last(&mut self) {
-        if !self.sessions.is_empty() {
-            self.selected = self.sessions.len() - 1;
+        if let Some(index) = self.matching_indices().last() {
+            self.selected = *index;
         }
+    }
+
+    fn matching_indices(&self) -> Vec<usize> {
+        self.sessions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, session)| {
+                session_name_matches(&session.name, &self.query).then_some(index)
+            })
+            .collect()
+    }
+
+    fn has_matches(&self) -> bool {
+        self.sessions
+            .iter()
+            .any(|session| session_name_matches(&session.name, &self.query))
+    }
+
+    fn select_first_match(&mut self) {
+        let matches = self.matching_indices();
+        if !matches.contains(&self.selected) {
+            if let Some(index) = matches.first() {
+                self.selected = *index;
+            }
+        }
+        self.top = 0;
     }
 
     fn reorder_up(&mut self) -> AppResult<()> {
@@ -207,7 +278,11 @@ impl App {
         let next_selected_name = self
             .sessions
             .get(self.selected + 1)
-            .or_else(|| self.selected.checked_sub(1).and_then(|index| self.sessions.get(index)))
+            .or_else(|| {
+                self.selected
+                    .checked_sub(1)
+                    .and_then(|index| self.sessions.get(index))
+            })
             .map(|session| session.name.clone());
         tmux_status(
             &self.tmux_socket_name,
@@ -243,11 +318,19 @@ impl App {
 
     fn ensure_visible(&mut self) {
         let viewport = self.viewport_height();
+        let Some(position) = self
+            .matching_indices()
+            .iter()
+            .position(|index| *index == self.selected)
+        else {
+            self.top = 0;
+            return;
+        };
 
-        if self.selected < self.top {
-            self.top = self.selected;
-        } else if self.selected >= self.top + viewport {
-            self.top = self.selected + 1 - viewport;
+        if position < self.top {
+            self.top = position;
+        } else if position >= self.top + viewport {
+            self.top = position + 1 - viewport;
         }
     }
 
@@ -257,7 +340,8 @@ impl App {
     }
 
     fn visible_list_height(&self) -> usize {
-        self.viewport_height().min(self.sessions.len().max(1))
+        self.viewport_height()
+            .min(self.matching_indices().len().max(1))
     }
 
     fn layout(&self) -> Layout {
@@ -336,33 +420,47 @@ impl App {
     }
 
     fn render_list_area(&self, stdout: &mut impl Write) -> AppResult<()> {
+        let matches = self.matching_indices();
         for visible_row in 0..self.visible_list_height() {
-            let session_index = self.top + visible_row;
+            let session_index = matches.get(self.top + visible_row).copied();
             self.render_session_row_at(stdout, visible_row, session_index)?;
         }
         Ok(())
     }
 
     fn render_session_row(&self, stdout: &mut impl Write, session_index: usize) -> AppResult<()> {
-        if session_index < self.top || session_index >= self.top + self.viewport_height() {
+        let Some(position) = self
+            .matching_indices()
+            .iter()
+            .position(|index| *index == session_index)
+        else {
+            return Ok(());
+        };
+        if position < self.top || position >= self.top + self.viewport_height() {
             return Ok(());
         }
 
-        let visible_row = session_index - self.top;
-        self.render_session_row_at(stdout, visible_row, session_index)
+        let visible_row = position - self.top;
+        self.render_session_row_at(stdout, visible_row, Some(session_index))
     }
 
     fn render_session_row_at(
         &self,
         stdout: &mut impl Write,
         visible_row: usize,
-        session_index: usize,
+        session_index: Option<usize>,
     ) -> AppResult<()> {
         let layout = self.layout();
         let row = layout.list_row_start + visible_row;
 
-        if let Some(session) = self.sessions.get(session_index) {
-            let pointer = if session_index == self.selected { ">" } else { " " };
+        if let Some((session_index, session)) =
+            session_index.and_then(|index| self.sessions.get(index).map(|session| (index, session)))
+        {
+            let pointer = if session_index == self.selected {
+                ">"
+            } else {
+                " "
+            };
             let pin = if session.pinned { "!" } else { " " };
             let current = if session.is_current { "*" } else { "" };
             let last = format_relative_activity(session.last_activity);
@@ -380,7 +478,13 @@ impl App {
                 &line,
                 self.cols.saturating_sub(layout.table_col.saturating_sub(1)),
             );
-            write_at(stdout, row, layout.table_col, &line, session_index == self.selected)?;
+            write_at(
+                stdout,
+                row,
+                layout.table_col,
+                &line,
+                session_index == self.selected,
+            )?;
         } else {
             write_row(stdout, row, "", false)?;
         }
@@ -390,7 +494,20 @@ impl App {
     fn render_footer(&self, stdout: &mut impl Write) -> AppResult<()> {
         let layout = self.layout();
         write_row(stdout, layout.blank_row, "", false)?;
-        if self.status.is_empty() {
+        if self.searching {
+            let suffix = if self.has_matches() {
+                ""
+            } else {
+                "  No matching sessions"
+            };
+            write_at(
+                stdout,
+                layout.status_row,
+                1,
+                &truncate(&format!("/{}{suffix}", self.query), self.cols),
+                false,
+            )?;
+        } else if self.status.is_empty() {
             write_row(stdout, layout.status_row, "", false)?;
         } else {
             write_at(
@@ -417,12 +534,20 @@ impl App {
             &self.tmux_socket_path,
         )?;
         self.selected = preferred_name
-            .and_then(|name| self.sessions.iter().position(|session| session.name == name))
+            .and_then(|name| {
+                self.sessions
+                    .iter()
+                    .position(|session| session.name == name)
+            })
             .or_else(|| self.sessions.iter().position(|session| session.is_current))
             .unwrap_or_else(|| previous_selected.min(self.sessions.len().saturating_sub(1)));
         self.top = self.top.min(self.selected);
         Ok(())
     }
+}
+
+fn session_name_matches(name: &str, query: &str) -> bool {
+    name.to_lowercase().contains(&query.to_lowercase())
 }
 
 struct TerminalGuard {
@@ -476,7 +601,11 @@ fn load_sessions(
     let raw_sessions = tmux_output(
         socket_name,
         socket_path,
-        &["list-sessions", "-F", "#{session_name}\t#{session_activity}"],
+        &[
+            "list-sessions",
+            "-F",
+            "#{session_name}\t#{session_activity}",
+        ],
     )?;
 
     let mut sessions = parse_sessions(&raw_sessions, &current_session, &pinned_names)?;
@@ -736,7 +865,7 @@ fn main() -> AppResult<()> {
 mod tests {
     use super::{
         Session, arrange_sessions, format_relative_activity, pinned_names_from_sessions,
-        write_pinned_names,
+        session_name_matches, write_pinned_names,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -796,7 +925,10 @@ mod tests {
         let pin_file = temp_state_file("pins");
         let pins = vec!["config".to_string(), "dashboard".to_string()];
         write_pinned_names(&pin_file, &pins).unwrap();
-        assert_eq!(fs::read_to_string(&pin_file).unwrap(), "config\ndashboard\n");
+        assert_eq!(
+            fs::read_to_string(&pin_file).unwrap(),
+            "config\ndashboard\n"
+        );
         let _ = fs::remove_file(pin_file);
     }
 
@@ -812,5 +944,12 @@ mod tests {
         assert_eq!(format_relative_activity(now.saturating_sub(12)), "12s");
         assert_eq!(format_relative_activity(now.saturating_sub(180)), "3m");
         assert_eq!(format_relative_activity(now.saturating_sub(7200)), "2h");
+    }
+
+    #[test]
+    fn session_name_search_is_case_insensitive() {
+        assert!(session_name_matches("Guide-Helper", "helper"));
+        assert!(session_name_matches("Guide-Helper", "GUIDE"));
+        assert!(!session_name_matches("Guide-Helper", "dashboard"));
     }
 }
