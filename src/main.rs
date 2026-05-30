@@ -415,7 +415,27 @@ impl App {
     }
 
     fn render_static(&self, stdout: &mut impl Write) -> AppResult<()> {
-        let _ = stdout;
+        let layout = self.layout();
+        if layout.list_row_start > 1 {
+            let row = layout.list_row_start - 1;
+            let label = if self.searching {
+                let suffix = if self.has_matches() {
+                    ""
+                } else {
+                    "  No matching sessions"
+                };
+                format!("Search: /{}{suffix}", self.query)
+            } else {
+                "Press / to search sessions".to_string()
+            };
+            write_at(
+                stdout,
+                row,
+                layout.table_col,
+                &truncate(&label, self.cols),
+                false,
+            )?;
+        }
         Ok(())
     }
 
