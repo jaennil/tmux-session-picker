@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -81,9 +82,101 @@ fn first_session_row_position(rows: &[VisibleRow]) -> usize {
         .unwrap_or(0)
 }
 
+fn session_indices_for_group(
+    sessions: &[Session],
+    groups: &GroupState,
+    group_index: usize,
+) -> Vec<usize> {
+    sessions
+        .iter()
+        .enumerate()
+        .filter_map(|(session_index, session)| {
+            let session_group = groups.group_for_session(&session.name);
+            let target_group = (group_index < groups.groups.len()).then_some(group_index);
+            (session_group == target_group).then_some(session_index)
+        })
+        .collect()
+}
+
+fn selected_count_for_group(
+    sessions: &[Session],
+    groups: &GroupState,
+    selected_sessions: &BTreeSet<String>,
+    group_index: usize,
+) -> (usize, usize) {
+    let group_sessions = session_indices_for_group(sessions, groups, group_index);
+    let selected = group_sessions
+        .iter()
+        .filter(|index| selected_sessions.contains(&sessions[**index].name))
+        .count();
+    (selected, group_sessions.len())
+}
+
+fn toggle_selection_for_session(selected_sessions: &mut BTreeSet<String>, session_name: &str) {
+    if !selected_sessions.remove(session_name) {
+        selected_sessions.insert(session_name.to_string());
+    }
+}
+
+fn toggle_selection_for_group(
+    selected_sessions: &mut BTreeSet<String>,
+    sessions: &[Session],
+    groups: &GroupState,
+    group_index: usize,
+) {
+    let group_sessions = session_indices_for_group(sessions, groups, group_index);
+    let all_selected = group_sessions
+        .iter()
+        .all(|index| selected_sessions.contains(&sessions[*index].name));
+
+    for index in group_sessions {
+        if all_selected {
+            selected_sessions.remove(&sessions[index].name);
+        } else {
+            selected_sessions.insert(sessions[index].name.clone());
+        }
+    }
+}
+
+fn toggle_selection_for_rows(
+    selected_sessions: &mut BTreeSet<String>,
+    sessions: &[Session],
+    rows: &[VisibleRow],
+) {
+    let session_indices = rows
+        .iter()
+        .filter_map(|row| match row {
+            VisibleRow::Session(index) => Some(*index),
+            VisibleRow::Group(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let all_selected = session_indices
+        .iter()
+        .all(|index| selected_sessions.contains(&sessions[*index].name));
+
+    for index in session_indices {
+        if all_selected {
+            selected_sessions.remove(&sessions[index].name);
+        } else {
+            selected_sessions.insert(sessions[index].name.clone());
+        }
+    }
+}
+
+fn prune_selected_sessions(selected_sessions: &mut BTreeSet<String>, sessions: &[Session]) {
+    selected_sessions.retain(|name| sessions.iter().any(|session| session.name == *name));
+}
+
+fn bulk_pin_target_state(sessions: &[Session], selected_sessions: &BTreeSet<String>) -> bool {
+    sessions
+        .iter()
+        .any(|session| selected_sessions.contains(&session.name) && !session.pinned)
+}
+
 struct App {
     sessions: Vec<Session>,
     groups: GroupState,
+    selected_sessions: BTreeSet<String>,
     selected: usize,
     top: usize,
     rows: usize,
@@ -99,11 +192,11 @@ struct App {
     prompt: Option<Prompt>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum NameAction {
     Create,
     Rename(usize),
-    CreateAndMove(usize),
+    CreateAndMove(Vec<String>),
 }
 
 enum Prompt {
@@ -113,7 +206,14 @@ enum Prompt {
         action: NameAction,
     },
     Move {
-        session_index: usize,
+        session_names: Vec<String>,
+        choice: usize,
+    },
+    ConfirmKill {
+        session_names: Vec<String>,
+        skipped_current: usize,
+    },
+    Action {
         choice: usize,
     },
 }
@@ -150,6 +250,7 @@ impl App {
         Ok(Self {
             sessions,
             groups,
+            selected_sessions: BTreeSet::new(),
             selected,
             top: 0,
             rows,
@@ -200,6 +301,7 @@ impl App {
                         self.query.pop();
                         self.select_first_match();
                     }
+                    b' ' => self.toggle_selected_row_selection(),
                     value if value.is_ascii_graphic() || value == b' ' => {
                         self.query.push(char::from(value));
                         self.select_first_match();
@@ -227,6 +329,10 @@ impl App {
                 b'd' => self.delete_selected_group()?,
                 b'h' => self.collapse_selected()?,
                 b'l' => self.expand_selected()?,
+                b' ' => self.toggle_selected_row_selection(),
+                b'a' => self.toggle_current_group_selection(),
+                b'A' => self.toggle_visible_selection(),
+                b'v' => self.clear_selection(),
                 b'p' => self.toggle_pin()?,
                 b'x' => self.kill_selected()?,
                 b'J' => self.reorder_down()?,
@@ -389,6 +495,26 @@ impl App {
     }
 
     fn toggle_pin(&mut self) -> AppResult<()> {
+        if !self.selected_sessions.is_empty() {
+            let target_state = bulk_pin_target_state(&self.sessions, &self.selected_sessions);
+            let selected_count = self.selected_live_session_names().len();
+            for session in &mut self.sessions {
+                if self.selected_sessions.contains(&session.name) {
+                    session.pinned = target_state;
+                }
+            }
+
+            let pinned_names = pinned_names_from_sessions(&self.sessions);
+            arrange_sessions(&mut self.sessions, &pinned_names);
+            self.write_pins()?;
+            self.status = if target_state {
+                format!("Pinned {selected_count} sessions")
+            } else {
+                format!("Unpinned {selected_count} sessions")
+            };
+            return Ok(());
+        }
+
         let Some(session_index) = self.selected_session_index() else {
             self.status = "Select a session to pin it".to_string();
             return Ok(());
@@ -413,6 +539,11 @@ impl App {
     }
 
     fn kill_selected(&mut self) -> AppResult<()> {
+        if !self.selected_sessions.is_empty() {
+            self.begin_kill_selected_sessions();
+            return Ok(());
+        }
+
         let Some(session_index) = self.selected_session_index() else {
             self.status = "Select a session to kill it".to_string();
             return Ok(());
@@ -446,6 +577,11 @@ impl App {
     }
 
     fn activate_selected(&mut self) -> AppResult<bool> {
+        if !self.selected_sessions.is_empty() {
+            self.prompt = Some(Prompt::Action { choice: 0 });
+            return Ok(false);
+        }
+
         let Some(row) = self.selected_row() else {
             return Ok(false);
         };
@@ -491,16 +627,19 @@ impl App {
     }
 
     fn begin_move_session(&mut self) {
-        let Some(session_index) = self.selected_session_index() else {
+        let Some(session_names) = self.target_session_names() else {
             self.status = "Select a session to move it".to_string();
             return;
         };
-        let choice = self
-            .groups
-            .group_for_session(&self.sessions[session_index].name)
-            .unwrap_or(self.groups.groups.len());
+        let choice = if session_names.len() == 1 {
+            self.groups
+                .group_for_session(&session_names[0])
+                .unwrap_or(self.groups.groups.len())
+        } else {
+            self.groups.groups.len()
+        };
         self.prompt = Some(Prompt::Move {
-            session_index,
+            session_names,
             choice,
         });
     }
@@ -513,7 +652,7 @@ impl App {
         match &mut prompt {
             Prompt::Name { value, action, .. } => match byte {
                 b'\r' | b'\n' => {
-                    let result = self.submit_group_name(value, *action);
+                    let result = self.submit_group_name(value, action.clone());
                     if let Err(err) = result {
                         self.status = err;
                         self.prompt = Some(prompt);
@@ -531,7 +670,7 @@ impl App {
                 _ => self.prompt = Some(prompt),
             },
             Prompt::Move {
-                session_index,
+                session_names,
                 choice,
             } => {
                 let option_count = self.groups.groups.len() + 2;
@@ -541,21 +680,56 @@ impl App {
                     b'g' => *choice = 0,
                     b'G' => *choice = option_count - 1,
                     b'\r' | b'\n' => {
-                        let session_index = *session_index;
+                        let session_names = session_names.clone();
                         let choice = *choice;
                         if choice < self.groups.groups.len() {
-                            self.move_session_to(session_index, Some(choice))?;
+                            self.move_sessions_to(&session_names, Some(choice))?;
                             return Ok(());
                         }
                         if choice == self.groups.groups.len() {
-                            self.move_session_to(session_index, None)?;
+                            self.move_sessions_to(&session_names, None)?;
                             return Ok(());
                         }
                         self.prompt = Some(Prompt::Name {
                             label: "NEW GROUP",
                             value: String::new(),
-                            action: NameAction::CreateAndMove(session_index),
+                            action: NameAction::CreateAndMove(session_names),
                         });
+                        return Ok(());
+                    }
+                    0x1b | 0x03 => {
+                        self.status = "Cancelled".to_string();
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                self.prompt = Some(prompt);
+            }
+            Prompt::ConfirmKill {
+                session_names,
+                skipped_current,
+            } => match byte {
+                b'y' | b'Y' => {
+                    let session_names = session_names.clone();
+                    let skipped_current = *skipped_current;
+                    self.kill_session_names(&session_names, skipped_current)?;
+                }
+                b'n' | b'N' | 0x1b | 0x03 => self.status = "Cancelled".to_string(),
+                _ => self.prompt = Some(prompt),
+            },
+            Prompt::Action { choice } => {
+                let action_count = 4;
+                match byte {
+                    b'j' => *choice = (*choice + 1).min(action_count - 1),
+                    b'k' => *choice = choice.saturating_sub(1),
+                    b'\r' | b'\n' => {
+                        let choice = *choice;
+                        match choice {
+                            0 => self.begin_move_session(),
+                            1 => self.toggle_pin()?,
+                            2 => self.begin_kill_selected_sessions(),
+                            _ => self.clear_selection(),
+                        }
                         return Ok(());
                     }
                     0x1b | 0x03 => {
@@ -584,14 +758,18 @@ impl App {
                 self.groups.save(&self.group_file)?;
                 self.status = format!("Renamed group to {}", self.groups.groups[group_index].name);
             }
-            NameAction::CreateAndMove(session_index) => {
+            NameAction::CreateAndMove(session_names) => {
                 let group_index = self.groups.add_group(value)?;
-                let session_name = self.sessions[session_index].name.clone();
-                self.groups.move_session(&session_name, Some(group_index));
+                for session_name in &session_names {
+                    self.groups.move_session(session_name, Some(group_index));
+                }
                 self.groups.save(&self.group_file)?;
-                self.select_session_by_name(&session_name);
+                if let Some(session_name) = session_names.first() {
+                    self.select_session_by_name(session_name);
+                }
                 self.status = format!(
-                    "Moved {session_name} to {}",
+                    "Moved {} sessions to {}",
+                    session_names.len(),
                     self.groups.groups[group_index].name
                 );
             }
@@ -599,26 +777,162 @@ impl App {
         Ok(())
     }
 
-    fn move_session_to(
+    fn move_sessions_to(
         &mut self,
-        session_index: usize,
+        session_names: &[String],
         group_index: Option<usize>,
     ) -> AppResult<()> {
-        let session_name = self.sessions[session_index].name.clone();
-        self.groups.move_session(&session_name, group_index);
+        for session_name in session_names {
+            self.groups.move_session(session_name, group_index);
+        }
         if let Some(group) = group_index.and_then(|index| self.groups.groups.get_mut(index)) {
             group.collapsed = false;
         } else {
             self.ungrouped_collapsed = false;
         }
         self.write_groups()?;
-        self.select_session_by_name(&session_name);
+        if let Some(session_name) = session_names.first() {
+            self.select_session_by_name(session_name);
+        }
         let destination = group_index
             .and_then(|index| self.groups.groups.get(index))
             .map(|group| group.name.as_str())
             .unwrap_or(groups::UNGROUPED_NAME);
-        self.status = format!("Moved {session_name} to {destination}");
+        self.status = if session_names.len() == 1 {
+            format!("Moved {} to {destination}", session_names[0])
+        } else {
+            format!("Moved {} sessions to {destination}", session_names.len())
+        };
         Ok(())
+    }
+
+    fn begin_kill_selected_sessions(&mut self) {
+        let (session_names, skipped_current) = self.killable_selected_session_names();
+        if session_names.is_empty() {
+            self.status = if skipped_current > 0 {
+                "Cannot kill current session".to_string()
+            } else {
+                "No selected sessions to kill".to_string()
+            };
+            return;
+        }
+        self.prompt = Some(Prompt::ConfirmKill {
+            session_names,
+            skipped_current,
+        });
+    }
+
+    fn kill_session_names(
+        &mut self,
+        session_names: &[String],
+        skipped_current: usize,
+    ) -> AppResult<()> {
+        for session_name in session_names {
+            tmux_status(
+                &self.tmux_socket_name,
+                &self.tmux_socket_path,
+                &["kill-session", "-t", session_name],
+            )?;
+            self.selected_sessions.remove(session_name);
+        }
+        self.reload_sessions(None)?;
+        self.status = if skipped_current > 0 {
+            format!("Killed {}; skipped current", session_names.len())
+        } else {
+            format!("Killed {} sessions", session_names.len())
+        };
+        Ok(())
+    }
+
+    fn selected_live_session_names(&self) -> Vec<String> {
+        self.sessions
+            .iter()
+            .filter(|session| self.selected_sessions.contains(&session.name))
+            .map(|session| session.name.clone())
+            .collect()
+    }
+
+    fn target_session_names(&self) -> Option<Vec<String>> {
+        let selected_names = self.selected_live_session_names();
+        if !selected_names.is_empty() {
+            return Some(selected_names);
+        }
+
+        self.selected_session_index()
+            .map(|index| vec![self.sessions[index].name.clone()])
+    }
+
+    fn killable_selected_session_names(&self) -> (Vec<String>, usize) {
+        let mut skipped_current = 0;
+        let session_names = self
+            .sessions
+            .iter()
+            .filter(|session| self.selected_sessions.contains(&session.name))
+            .filter_map(|session| {
+                if session.is_current {
+                    skipped_current += 1;
+                    None
+                } else {
+                    Some(session.name.clone())
+                }
+            })
+            .collect();
+        (session_names, skipped_current)
+    }
+
+    fn toggle_selected_row_selection(&mut self) {
+        match self.selected_row() {
+            Some(VisibleRow::Session(index)) => toggle_selection_for_session(
+                &mut self.selected_sessions,
+                &self.sessions[index].name,
+            ),
+            Some(VisibleRow::Group(index)) => toggle_selection_for_group(
+                &mut self.selected_sessions,
+                &self.sessions,
+                &self.groups,
+                index,
+            ),
+            None => {}
+        }
+        self.update_selection_status();
+    }
+
+    fn toggle_current_group_selection(&mut self) {
+        let group_index = match self.selected_row() {
+            Some(VisibleRow::Group(index)) => index,
+            Some(VisibleRow::Session(index)) => self
+                .groups
+                .group_for_session(&self.sessions[index].name)
+                .unwrap_or(self.groups.groups.len()),
+            None => return,
+        };
+        toggle_selection_for_group(
+            &mut self.selected_sessions,
+            &self.sessions,
+            &self.groups,
+            group_index,
+        );
+        self.update_selection_status();
+    }
+
+    fn toggle_visible_selection(&mut self) {
+        let rows = self.visible_rows();
+        toggle_selection_for_rows(&mut self.selected_sessions, &self.sessions, &rows);
+        self.update_selection_status();
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected_sessions.clear();
+        self.status = "Selection cleared".to_string();
+    }
+
+    fn update_selection_status(&mut self) {
+        let count = self.selected_live_session_names().len();
+        self.status = if count == 0 {
+            "Selection cleared".to_string()
+        } else {
+            format!("Selected {count} sessions")
+        };
     }
 
     fn delete_selected_group(&mut self) -> AppResult<()> {
@@ -736,7 +1050,7 @@ impl App {
             .unwrap_or(8);
         let min_name_width = 16;
         let activity_width = 4;
-        let fixed_width = 3 + min_name_width + 2 + activity_width + 2 + 3;
+        let fixed_width = 7 + min_name_width + 2 + activity_width + 2 + 3;
         let max_name_width = self
             .cols
             .saturating_sub(fixed_width)
@@ -784,8 +1098,7 @@ impl App {
                 };
                 format!("Search: /{}{suffix}", self.query)
             } else {
-                "Enter open/toggle  h/l fold  n new  m move  r rename  d delete  / search"
-                    .to_string()
+                "Space select  a/A group/all  v clear  m move  p pin  x kill  / search".to_string()
             };
             write_at(
                 stdout,
@@ -825,24 +1138,32 @@ impl App {
                 } else {
                     (groups::UNGROUPED_NAME, self.ungrouped_collapsed)
                 };
-                let count = self
-                    .sessions
-                    .iter()
-                    .filter(|session| {
-                        self.groups.group_for_session(&session.name)
-                            == (group_index < self.groups.groups.len()).then_some(group_index)
-                    })
-                    .count();
+                let (selected_count, count) = selected_count_for_group(
+                    &self.sessions,
+                    &self.groups,
+                    &self.selected_sessions,
+                    group_index,
+                );
+                let count_label = if selected_count > 0 {
+                    format!("{selected_count}/{count}")
+                } else {
+                    count.to_string()
+                };
                 let marker = if collapsed { "▸" } else { "▼" };
-                format!("{pointer} {marker} {name} ({count})")
+                format!("{pointer} {marker} {name} ({count_label})")
             }
             Some(VisibleRow::Session(session_index)) => {
                 let session = &self.sessions[session_index];
+                let checkbox = if self.selected_sessions.contains(&session.name) {
+                    "[x]"
+                } else {
+                    "[ ]"
+                };
                 let pin = if session.pinned { "!" } else { " " };
                 let current = if session.is_current { "*" } else { "" };
                 let last = format_relative_activity(session.last_activity);
                 format!(
-                    "{pointer}   {:<name_width$}  {:>activity_width$}  {:^3} {pin}",
+                    "{pointer} {checkbox} {:<name_width$}  {:>activity_width$}  {:^3} {pin}",
                     session.name,
                     last,
                     current,
@@ -871,7 +1192,7 @@ impl App {
             let text = match prompt {
                 Prompt::Name { label, value, .. } => format!("{label}: {value}"),
                 Prompt::Move {
-                    session_index,
+                    session_names,
                     choice,
                 } => {
                     let destination = if *choice < self.groups.groups.len() {
@@ -882,8 +1203,27 @@ impl App {
                         "New group..."
                     };
                     format!(
-                        "MOVE {} -> [{destination}]  j/k choose  Enter confirm  Esc cancel",
-                        self.sessions[*session_index].name
+                        "MOVE {} sessions -> [{destination}]  j/k choose  Enter confirm  Esc cancel",
+                        session_names.len()
+                    )
+                }
+                Prompt::ConfirmKill {
+                    session_names,
+                    skipped_current,
+                } => {
+                    let suffix = if *skipped_current > 0 {
+                        " (current skipped)"
+                    } else {
+                        ""
+                    };
+                    format!("KILL {} sessions{suffix}? y/N", session_names.len())
+                }
+                Prompt::Action { choice } => {
+                    let actions = ["move", "pin/unpin", "kill", "clear"];
+                    format!(
+                        "SELECTED {} sessions: [{}]  j/k choose  Enter confirm  Esc cancel",
+                        self.selected_live_session_names().len(),
+                        actions[*choice]
                     )
                 }
             };
@@ -936,6 +1276,7 @@ impl App {
             &self.tmux_socket_name,
             &self.tmux_socket_path,
         )?;
+        prune_selected_sessions(&mut self.selected_sessions, &self.sessions);
         let selected_name = preferred_name.map(str::to_string).or_else(|| {
             self.sessions
                 .iter()
@@ -1281,11 +1622,13 @@ fn main() -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Session, VisibleRow, arrange_sessions, build_visible_rows, first_session_row_position,
-        format_relative_activity, pinned_names_from_sessions, session_name_matches,
-        write_pinned_names,
+        Session, VisibleRow, arrange_sessions, build_visible_rows, bulk_pin_target_state,
+        first_session_row_position, format_relative_activity, pinned_names_from_sessions,
+        prune_selected_sessions, selected_count_for_group, session_name_matches,
+        toggle_selection_for_group, toggle_selection_for_rows, write_pinned_names,
     };
     use crate::groups::{Group, GroupState};
+    use std::collections::BTreeSet;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1464,5 +1807,114 @@ mod tests {
         assert_eq!(first_session_row_position(&rows), 1);
         assert_eq!(first_session_row_position(&[VisibleRow::Group(0)]), 0);
         assert_eq!(first_session_row_position(&[]), 0);
+    }
+
+    #[test]
+    fn group_selection_counts_live_sessions_only() {
+        let sessions = vec![
+            session("api", 0, false),
+            session("database", 0, false),
+            session("scratch", 0, false),
+        ];
+        let groups = GroupState {
+            version: 1,
+            groups: vec![Group {
+                name: "Work".to_string(),
+                collapsed: true,
+                sessions: vec![
+                    "api".to_string(),
+                    "database".to_string(),
+                    "stale".to_string(),
+                ],
+            }],
+        };
+        let selected = BTreeSet::from(["api".to_string(), "stale".to_string()]);
+
+        assert_eq!(
+            selected_count_for_group(&sessions, &groups, &selected, 0),
+            (1, 2)
+        );
+        assert_eq!(
+            selected_count_for_group(&sessions, &groups, &selected, 1),
+            (0, 1)
+        );
+    }
+
+    #[test]
+    fn toggling_group_selects_all_then_clears_all_live_members() {
+        let sessions = vec![
+            session("api", 0, false),
+            session("database", 0, false),
+            session("scratch", 0, false),
+        ];
+        let groups = GroupState {
+            version: 1,
+            groups: vec![Group {
+                name: "Work".to_string(),
+                collapsed: false,
+                sessions: vec!["api".to_string(), "database".to_string()],
+            }],
+        };
+        let mut selected = BTreeSet::from(["api".to_string()]);
+
+        toggle_selection_for_group(&mut selected, &sessions, &groups, 0);
+        assert_eq!(
+            selected,
+            BTreeSet::from(["api".to_string(), "database".to_string()])
+        );
+
+        toggle_selection_for_group(&mut selected, &sessions, &groups, 0);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn toggling_visible_sessions_respects_search_results() {
+        let sessions = vec![
+            session("api", 0, false),
+            session("database", 0, false),
+            session("scratch", 0, false),
+        ];
+        let groups = GroupState::default();
+        let rows = build_visible_rows(&sessions, &groups, "a", false);
+        let mut selected = BTreeSet::new();
+
+        toggle_selection_for_rows(&mut selected, &sessions, &rows);
+
+        assert_eq!(
+            selected,
+            BTreeSet::from([
+                "api".to_string(),
+                "database".to_string(),
+                "scratch".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn stale_selected_sessions_are_pruned_after_reload() {
+        let sessions = vec![session("api", 0, false), session("database", 0, false)];
+        let mut selected = BTreeSet::from(["api".to_string(), "gone".to_string()]);
+
+        prune_selected_sessions(&mut selected, &sessions);
+
+        assert_eq!(selected, BTreeSet::from(["api".to_string()]));
+    }
+
+    #[test]
+    fn bulk_pin_pins_when_any_selected_session_is_unpinned() {
+        let sessions = vec![
+            session("api", 0, true),
+            session("database", 0, false),
+            session("scratch", 0, false),
+        ];
+
+        assert!(bulk_pin_target_state(
+            &sessions,
+            &BTreeSet::from(["api".to_string(), "database".to_string()])
+        ));
+        assert!(!bulk_pin_target_state(
+            &sessions,
+            &BTreeSet::from(["api".to_string()])
+        ));
     }
 }

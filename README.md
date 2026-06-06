@@ -20,15 +20,19 @@ cargo build --release
 | `/` | Search sessions and groups by name |
 | `Backspace` | Remove the last search character |
 | `Esc` | Clear search |
-| `Enter` | Switch session or toggle group |
+| `Enter` | Switch session, toggle group, or open selected-session actions |
 | `h` / `l` | Collapse / expand group |
 | `n` | Create group |
-| `m` | Move session to a group |
+| `Space` | Toggle selected session or all sessions in a group |
+| `a` | Toggle all sessions in the current group |
+| `A` | Toggle all visible sessions |
+| `v` | Clear selected sessions |
+| `m` | Move selected sessions, or the highlighted session, to a group |
 | `r` | Rename group |
 | `d` | Delete group; sessions become ungrouped |
-| `p` | Pin / unpin session |
+| `p` | Pin / unpin selected sessions, or the highlighted session |
 | `J` / `K` | Reorder group or pinned session |
-| `x` | Kill selected session |
+| `x` | Kill selected sessions after confirmation, or kill highlighted session |
 | `q` | Quit |
 
 Set `TMUX_SESSION_GROUP_FILE` to use another group state file. This is useful
