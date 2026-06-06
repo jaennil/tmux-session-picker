@@ -201,6 +201,15 @@ fn shortcut_help_line(index: usize) -> String {
     format!("{key}: {action}")
 }
 
+fn help_status_line(index: usize) -> String {
+    format!(
+        "HELP {}/{}  {}  j/k next  g/G first/last  Esc close",
+        index + 1,
+        SHORTCUTS.len(),
+        shortcut_help_line(index)
+    )
+}
+
 fn next_help_index(current: usize, offset: isize) -> usize {
     current
         .checked_add_signed(offset)
@@ -1147,7 +1156,9 @@ impl App {
         let layout = self.layout();
         if layout.list_row_start > 1 {
             let row = layout.list_row_start - 1;
-            let label = if self.searching {
+            let label = if let Some(Prompt::Help { index }) = self.prompt.as_ref() {
+                help_status_line(*index)
+            } else if self.searching {
                 let suffix = if self.has_matches() {
                     ""
                 } else {
@@ -1283,14 +1294,7 @@ impl App {
                         actions[*choice]
                     )
                 }
-                Prompt::Help { index } => {
-                    format!(
-                        "HELP {}/{}  {}  j/k next  g/G first/last  Esc close",
-                        index + 1,
-                        SHORTCUTS.len(),
-                        shortcut_help_line(*index)
-                    )
-                }
+                Prompt::Help { index } => help_status_line(*index),
             };
             write_at(
                 stdout,
@@ -1689,7 +1693,7 @@ mod tests {
     use super::{
         App, Prompt, SHORTCUTS, Session, VisibleRow, arrange_sessions, build_visible_rows,
         bulk_pin_target_state, first_session_row_position, format_relative_activity,
-        next_help_index, pinned_names_from_sessions, prune_selected_sessions,
+        help_status_line, next_help_index, pinned_names_from_sessions, prune_selected_sessions,
         selected_count_for_group, session_name_matches, shortcut_help_line,
         toggle_selection_for_group, toggle_selection_for_rows, write_pinned_names,
     };
@@ -2009,6 +2013,7 @@ mod tests {
     fn shortcut_help_includes_question_mark_entry() {
         assert!(SHORTCUTS.iter().any(|(key, _)| *key == "?"));
         assert!(shortcut_help_line(0).contains(": "));
+        assert!(help_status_line(0).starts_with("HELP 1/"));
     }
 
     #[test]
