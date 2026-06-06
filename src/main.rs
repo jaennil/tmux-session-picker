@@ -243,6 +243,39 @@ fn move_popup_lines(groups: &GroupState, choice: usize, session_count: usize) ->
     lines
 }
 
+fn mode_line(
+    prompt: Option<&Prompt>,
+    searching: bool,
+    query: &str,
+    has_matches: bool,
+    selected_count: usize,
+) -> String {
+    match prompt {
+        Some(Prompt::Name { label, .. }) => format!("MODE input: {label}"),
+        Some(Prompt::Move { session_names, .. }) => {
+            format!(
+                "MODE move: {} sessions  j/k choose  Enter confirm",
+                session_names.len()
+            )
+        }
+        Some(Prompt::ConfirmKill { session_names, .. }) => {
+            format!("MODE confirm kill: {} sessions  y/N", session_names.len())
+        }
+        Some(Prompt::Action { .. }) => {
+            format!("MODE selected actions: {selected_count} sessions")
+        }
+        Some(Prompt::Help { .. }) => "MODE help: j/k scroll  Esc close".to_string(),
+        None if searching => {
+            let suffix = if has_matches { "" } else { "  no matches" };
+            format!("MODE search: /{query}{suffix}")
+        }
+        None if selected_count > 0 => {
+            format!("MODE selection: {selected_count} sessions  m move  p pin  x kill  v clear")
+        }
+        None => "MODE normal: j/k move  Space select  / search  ? help".to_string(),
+    }
+}
+
 fn next_help_index(current: usize, offset: isize) -> usize {
     current
         .checked_add_signed(offset)
@@ -1191,16 +1224,13 @@ impl App {
         let layout = self.layout();
         if layout.list_row_start > 1 {
             let row = layout.list_row_start - 1;
-            let label = if self.searching {
-                let suffix = if self.has_matches() {
-                    ""
-                } else {
-                    "  No matching sessions"
-                };
-                format!("Search: /{}{suffix}", self.query)
-            } else {
-                "Space select  a/A group/all  v clear  m move  p pin  x kill  ? help".to_string()
-            };
+            let label = mode_line(
+                self.prompt.as_ref(),
+                self.searching,
+                &self.query,
+                self.has_matches(),
+                self.selected_live_session_names().len(),
+            );
             write_at(
                 stdout,
                 row,
@@ -1821,7 +1851,7 @@ mod tests {
     use super::{
         App, Prompt, SHORTCUTS, Session, VisibleRow, arrange_sessions, build_visible_rows,
         bulk_pin_target_state, first_session_row_position, format_relative_activity,
-        help_popup_height, help_popup_lines, move_popup_lines, next_help_index,
+        help_popup_height, help_popup_lines, mode_line, move_popup_lines, next_help_index,
         pinned_names_from_sessions, prune_selected_sessions, selected_count_for_group,
         session_name_matches, toggle_selection_for_group, toggle_selection_for_rows,
         write_pinned_names,
@@ -2203,5 +2233,32 @@ mod tests {
         assert!(lines.iter().any(|line| line == "  Work"));
         assert!(lines.iter().any(|line| line == "> Ungrouped"));
         assert!(lines.iter().any(|line| line == "  New group..."));
+    }
+
+    #[test]
+    fn mode_line_describes_current_mode() {
+        assert!(mode_line(None, false, "", true, 0).starts_with("MODE normal"));
+        assert!(mode_line(None, false, "", true, 2).starts_with("MODE selection"));
+        assert_eq!(
+            mode_line(None, true, "api", false, 0),
+            "MODE search: /api  no matches"
+        );
+        assert!(
+            mode_line(Some(&Prompt::Help { index: 0 }), false, "", true, 0)
+                .starts_with("MODE help")
+        );
+        assert!(
+            mode_line(
+                Some(&Prompt::Move {
+                    session_names: vec!["api".to_string(), "db".to_string()],
+                    choice: 0,
+                }),
+                false,
+                "",
+                true,
+                2,
+            )
+            .starts_with("MODE move: 2 sessions")
+        );
     }
 }
