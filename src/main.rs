@@ -224,6 +224,25 @@ fn help_popup_height(rows: usize) -> usize {
     rows.saturating_sub(2).max(5)
 }
 
+fn move_popup_lines(groups: &GroupState, choice: usize, session_count: usize) -> Vec<String> {
+    let mut lines = Vec::with_capacity(groups.groups.len() + 4);
+    lines.push(format!("Move {session_count} sessions to"));
+    for (index, group) in groups.groups.iter().enumerate() {
+        let marker = if index == choice { ">" } else { " " };
+        lines.push(format!("{marker} {}", group.name));
+    }
+
+    let ungrouped_index = groups.groups.len();
+    let marker = if choice == ungrouped_index { ">" } else { " " };
+    lines.push(format!("{marker} {}", groups::UNGROUPED_NAME));
+
+    let new_group_index = groups.groups.len() + 1;
+    let marker = if choice == new_group_index { ">" } else { " " };
+    lines.push(format!("{marker} New group..."));
+    lines.push("j/k choose  Enter confirm  Esc cancel".to_string());
+    lines
+}
+
 fn next_help_index(current: usize, offset: isize) -> usize {
     current
         .checked_add_signed(offset)
@@ -1162,6 +1181,7 @@ impl App {
         self.render_static(&mut stdout)?;
         self.render_list_area(&mut stdout)?;
         self.render_footer(&mut stdout)?;
+        self.render_move_popup(&mut stdout)?;
         self.render_help_popup(&mut stdout)?;
         stdout.flush()?;
         Ok(())
@@ -1369,6 +1389,56 @@ impl App {
         let body_height = popup_height.saturating_sub(2);
         for offset in 0..body_height {
             let line = lines.get(offset).map(String::as_str).unwrap_or("");
+            let line = truncate(line, inner_width.saturating_sub(2));
+            let padded = format!(
+                "| {:<width$} |",
+                line,
+                width = inner_width.saturating_sub(2)
+            );
+            write_at(stdout, row_start + offset + 1, col_start, &padded, false)?;
+        }
+
+        let bottom = format!("+{}+", "-".repeat(inner_width));
+        write_at(
+            stdout,
+            row_start + popup_height - 1,
+            col_start,
+            &bottom,
+            false,
+        )?;
+        Ok(())
+    }
+
+    fn render_move_popup(&self, stdout: &mut impl Write) -> AppResult<()> {
+        let Some(Prompt::Move {
+            session_names,
+            choice,
+        }) = self.prompt.as_ref()
+        else {
+            return Ok(());
+        };
+
+        let lines = move_popup_lines(&self.groups, *choice, session_names.len());
+        let content_width = lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(self.cols.saturating_sub(4).max(1));
+        let popup_width = (content_width + 4).min(self.cols.max(1));
+        let popup_height = (lines.len() + 2).min(self.rows.max(1));
+        let row_start = self.rows.saturating_sub(popup_height) / 2 + 1;
+        let col_start = self.cols.saturating_sub(popup_width) / 2 + 1;
+        let inner_width = popup_width.saturating_sub(2);
+
+        let top = format!("+{}+", "-".repeat(inner_width));
+        write_at(stdout, row_start, col_start, &top, false)?;
+
+        for (offset, line) in lines
+            .iter()
+            .take(popup_height.saturating_sub(2))
+            .enumerate()
+        {
             let line = truncate(line, inner_width.saturating_sub(2));
             let padded = format!(
                 "| {:<width$} |",
@@ -1751,9 +1821,10 @@ mod tests {
     use super::{
         App, Prompt, SHORTCUTS, Session, VisibleRow, arrange_sessions, build_visible_rows,
         bulk_pin_target_state, first_session_row_position, format_relative_activity,
-        help_popup_height, help_popup_lines, next_help_index, pinned_names_from_sessions,
-        prune_selected_sessions, selected_count_for_group, session_name_matches,
-        toggle_selection_for_group, toggle_selection_for_rows, write_pinned_names,
+        help_popup_height, help_popup_lines, move_popup_lines, next_help_index,
+        pinned_names_from_sessions, prune_selected_sessions, selected_count_for_group,
+        session_name_matches, toggle_selection_for_group, toggle_selection_for_rows,
+        write_pinned_names,
     };
     use crate::groups::{Group, GroupState};
     use std::collections::BTreeSet;
@@ -2113,5 +2184,24 @@ mod tests {
             .filter(|line| line.starts_with("> ") || line.starts_with("  "))
             .count();
         assert!(shortcut_rows > 12);
+    }
+
+    #[test]
+    fn move_popup_lists_groups_and_special_targets() {
+        let groups = GroupState {
+            version: 1,
+            groups: vec![Group {
+                name: "Work".to_string(),
+                collapsed: false,
+                sessions: Vec::new(),
+            }],
+        };
+
+        let lines = move_popup_lines(&groups, 1, 2);
+
+        assert_eq!(lines[0], "Move 2 sessions to");
+        assert!(lines.iter().any(|line| line == "  Work"));
+        assert!(lines.iter().any(|line| line == "> Ungrouped"));
+        assert!(lines.iter().any(|line| line == "  New group..."));
     }
 }
