@@ -220,6 +220,10 @@ fn help_popup_lines(index: usize, max_entries: usize) -> Vec<String> {
     lines
 }
 
+fn help_popup_height(rows: usize) -> usize {
+    rows.saturating_sub(2).max(5)
+}
+
 fn next_help_index(current: usize, offset: isize) -> usize {
     current
         .checked_add_signed(offset)
@@ -1345,7 +1349,8 @@ impl App {
             return Ok(());
         };
 
-        let max_entries = self.rows.saturating_sub(8).clamp(1, 12);
+        let popup_height = help_popup_height(self.rows).min(self.rows.max(1));
+        let max_entries = popup_height.saturating_sub(4).max(1);
         let lines = help_popup_lines(*index, max_entries);
         let content_width = lines
             .iter()
@@ -1354,7 +1359,6 @@ impl App {
             .unwrap_or(0)
             .min(self.cols.saturating_sub(4).max(1));
         let popup_width = (content_width + 4).min(self.cols.max(1));
-        let popup_height = lines.len() + 2;
         let row_start = self.rows.saturating_sub(popup_height) / 2 + 1;
         let col_start = self.cols.saturating_sub(popup_width) / 2 + 1;
         let inner_width = popup_width.saturating_sub(2);
@@ -1362,7 +1366,9 @@ impl App {
         let top = format!("+{}+", "-".repeat(inner_width));
         write_at(stdout, row_start, col_start, &top, false)?;
 
-        for (offset, line) in lines.iter().enumerate() {
+        let body_height = popup_height.saturating_sub(2);
+        for offset in 0..body_height {
+            let line = lines.get(offset).map(String::as_str).unwrap_or("");
             let line = truncate(line, inner_width.saturating_sub(2));
             let padded = format!(
                 "| {:<width$} |",
@@ -1745,9 +1751,9 @@ mod tests {
     use super::{
         App, Prompt, SHORTCUTS, Session, VisibleRow, arrange_sessions, build_visible_rows,
         bulk_pin_target_state, first_session_row_position, format_relative_activity,
-        help_popup_lines, next_help_index, pinned_names_from_sessions, prune_selected_sessions,
-        selected_count_for_group, session_name_matches, toggle_selection_for_group,
-        toggle_selection_for_rows, write_pinned_names,
+        help_popup_height, help_popup_lines, next_help_index, pinned_names_from_sessions,
+        prune_selected_sessions, selected_count_for_group, session_name_matches,
+        toggle_selection_for_group, toggle_selection_for_rows, write_pinned_names,
     };
     use crate::groups::{Group, GroupState};
     use std::collections::BTreeSet;
@@ -2094,5 +2100,18 @@ mod tests {
 
         assert!(lines.iter().any(|line| line.starts_with("> g/G")));
         assert!(lines.last().unwrap().contains("Esc close"));
+    }
+
+    #[test]
+    fn shortcut_help_popup_uses_nearly_full_height() {
+        assert_eq!(help_popup_height(24), 22);
+        assert_eq!(help_popup_height(4), 5);
+
+        let lines = help_popup_lines(0, help_popup_height(24).saturating_sub(4));
+        let shortcut_rows = lines
+            .iter()
+            .filter(|line| line.starts_with("> ") || line.starts_with("  "))
+            .count();
+        assert!(shortcut_rows > 12);
     }
 }
