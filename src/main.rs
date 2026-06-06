@@ -173,6 +173,41 @@ fn bulk_pin_target_state(sessions: &[Session], selected_sessions: &BTreeSet<Stri
         .any(|session| selected_sessions.contains(&session.name) && !session.pinned)
 }
 
+const SHORTCUTS: &[(&str, &str)] = &[
+    ("j/k", "move cursor"),
+    ("g/G", "jump first/last"),
+    ("/", "search sessions and groups"),
+    ("Backspace", "delete search character"),
+    ("Esc", "clear search, cancel prompt, or quit"),
+    ("Enter", "switch session, toggle group, or act on selection"),
+    ("h/l", "collapse or expand group"),
+    ("n", "create group"),
+    ("Space", "toggle selected session or group"),
+    ("a", "toggle current group selection"),
+    ("A", "toggle visible session selection"),
+    ("v", "clear selected sessions"),
+    ("m", "move selected or highlighted sessions"),
+    ("r", "rename group"),
+    ("d", "delete group"),
+    ("p", "pin or unpin selected sessions"),
+    ("J/K", "reorder group or pinned session"),
+    ("x", "kill selected sessions"),
+    ("?", "show shortcuts"),
+    ("q", "quit"),
+];
+
+fn shortcut_help_line(index: usize) -> String {
+    let (key, action) = SHORTCUTS[index];
+    format!("{key}: {action}")
+}
+
+fn next_help_index(current: usize, offset: isize) -> usize {
+    current
+        .checked_add_signed(offset)
+        .unwrap_or(0)
+        .min(SHORTCUTS.len().saturating_sub(1))
+}
+
 struct App {
     sessions: Vec<Session>,
     groups: GroupState,
@@ -215,6 +250,9 @@ enum Prompt {
     },
     Action {
         choice: usize,
+    },
+    Help {
+        index: usize,
     },
 }
 
@@ -335,6 +373,7 @@ impl App {
                 b'v' => self.clear_selection(),
                 b'p' => self.toggle_pin()?,
                 b'x' => self.kill_selected()?,
+                b'?' => self.show_help(),
                 b'J' => self.reorder_down()?,
                 b'K' => self.reorder_up()?,
                 b'\r' | b'\n' if self.activate_selected()? => break,
@@ -740,6 +779,20 @@ impl App {
                 }
                 self.prompt = Some(prompt);
             }
+            Prompt::Help { index } => {
+                match byte {
+                    b'j' | b'l' | b' ' => *index = next_help_index(*index, 1),
+                    b'k' | b'h' | 0x7f | 0x08 => *index = next_help_index(*index, -1),
+                    b'g' => *index = 0,
+                    b'G' => *index = SHORTCUTS.len().saturating_sub(1),
+                    b'q' | b'?' | 0x1b | 0x03 | b'\r' | b'\n' => {
+                        self.status = "Closed help".to_string();
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                self.prompt = Some(prompt);
+            }
         }
         Ok(())
     }
@@ -926,6 +979,10 @@ impl App {
         self.status = "Selection cleared".to_string();
     }
 
+    fn show_help(&mut self) {
+        self.prompt = Some(Prompt::Help { index: 0 });
+    }
+
     fn update_selection_status(&mut self) {
         let count = self.selected_live_session_names().len();
         self.status = if count == 0 {
@@ -1098,7 +1155,7 @@ impl App {
                 };
                 format!("Search: /{}{suffix}", self.query)
             } else {
-                "Space select  a/A group/all  v clear  m move  p pin  x kill  / search".to_string()
+                "Space select  a/A group/all  v clear  m move  p pin  x kill  ? help".to_string()
             };
             write_at(
                 stdout,
@@ -1224,6 +1281,14 @@ impl App {
                         "SELECTED {} sessions: [{}]  j/k choose  Enter confirm  Esc cancel",
                         self.selected_live_session_names().len(),
                         actions[*choice]
+                    )
+                }
+                Prompt::Help { index } => {
+                    format!(
+                        "HELP {}/{}  {}  j/k next  g/G first/last  Esc close",
+                        index + 1,
+                        SHORTCUTS.len(),
+                        shortcut_help_line(*index)
                     )
                 }
             };
@@ -1622,9 +1687,10 @@ fn main() -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Session, VisibleRow, arrange_sessions, build_visible_rows, bulk_pin_target_state,
-        first_session_row_position, format_relative_activity, pinned_names_from_sessions,
-        prune_selected_sessions, selected_count_for_group, session_name_matches,
+        App, Prompt, SHORTCUTS, Session, VisibleRow, arrange_sessions, build_visible_rows,
+        bulk_pin_target_state, first_session_row_position, format_relative_activity,
+        next_help_index, pinned_names_from_sessions, prune_selected_sessions,
+        selected_count_for_group, session_name_matches, shortcut_help_line,
         toggle_selection_for_group, toggle_selection_for_rows, write_pinned_names,
     };
     use crate::groups::{Group, GroupState};
@@ -1648,6 +1714,27 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("tmux-session-picker-test-{nanos}.{suffix}"))
+    }
+
+    fn app_with_sessions(sessions: Vec<Session>) -> App {
+        App {
+            sessions,
+            groups: GroupState::default(),
+            selected_sessions: BTreeSet::new(),
+            selected: 0,
+            top: 0,
+            rows: 24,
+            cols: 80,
+            pin_file: PathBuf::new(),
+            group_file: PathBuf::new(),
+            tmux_socket_name: None,
+            tmux_socket_path: None,
+            status: String::new(),
+            query: String::new(),
+            searching: false,
+            ungrouped_collapsed: false,
+            prompt: None,
+        }
     }
 
     #[test]
@@ -1916,5 +2003,32 @@ mod tests {
             &sessions,
             &BTreeSet::from(["api".to_string()])
         ));
+    }
+
+    #[test]
+    fn shortcut_help_includes_question_mark_entry() {
+        assert!(SHORTCUTS.iter().any(|(key, _)| *key == "?"));
+        assert!(shortcut_help_line(0).contains(": "));
+    }
+
+    #[test]
+    fn shortcut_help_navigation_clamps_to_bounds() {
+        assert_eq!(next_help_index(0, -1), 0);
+        assert_eq!(next_help_index(0, 1), 1);
+        assert_eq!(next_help_index(SHORTCUTS.len() - 1, 1), SHORTCUTS.len() - 1);
+    }
+
+    #[test]
+    fn show_help_opens_and_pages_shortcut_prompt() {
+        let mut app = app_with_sessions(vec![session("api", 0, false)]);
+
+        app.show_help();
+        assert!(matches!(app.prompt, Some(Prompt::Help { index: 0 })));
+
+        app.handle_prompt(b'j').unwrap();
+        assert!(matches!(app.prompt, Some(Prompt::Help { index: 1 })));
+
+        app.handle_prompt(0x1b).unwrap();
+        assert!(app.prompt.is_none());
     }
 }

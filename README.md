@@ -33,6 +33,7 @@ cargo build --release
 | `p` | Pin / unpin selected sessions, or the highlighted session |
 | `J` / `K` | Reorder group or pinned session |
 | `x` | Kill selected sessions after confirmation, or kill highlighted session |
+| `?` | Show shortcut help |
 | `q` | Quit |
 
 Set `TMUX_SESSION_GROUP_FILE` to use another group state file. This is useful
