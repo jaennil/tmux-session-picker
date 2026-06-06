@@ -196,18 +196,28 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("q", "quit"),
 ];
 
-fn shortcut_help_line(index: usize) -> String {
-    let (key, action) = SHORTCUTS[index];
-    format!("{key}: {action}")
-}
+fn help_popup_lines(index: usize, max_entries: usize) -> Vec<String> {
+    let max_entries = max_entries.max(1);
+    let half = max_entries / 2;
+    let mut start = index.saturating_sub(half);
+    if start + max_entries > SHORTCUTS.len() {
+        start = SHORTCUTS.len().saturating_sub(max_entries);
+    }
+    let end = (start + max_entries).min(SHORTCUTS.len());
 
-fn help_status_line(index: usize) -> String {
-    format!(
-        "HELP {}/{}  {}  j/k next  g/G first/last  Esc close",
+    let mut lines = Vec::with_capacity(end.saturating_sub(start) + 3);
+    lines.push("Shortcuts".to_string());
+    for (shortcut_index, (key, action)) in SHORTCUTS[start..end].iter().enumerate() {
+        let shortcut_index = start + shortcut_index;
+        let marker = if shortcut_index == index { ">" } else { " " };
+        lines.push(format!("{marker} {key:<10} {action}"));
+    }
+    lines.push(format!(
+        "{}/{}  j/k scroll  g/G first/last  Esc close",
         index + 1,
-        SHORTCUTS.len(),
-        shortcut_help_line(index)
-    )
+        SHORTCUTS.len()
+    ));
+    lines
 }
 
 fn next_help_index(current: usize, offset: isize) -> usize {
@@ -1148,6 +1158,7 @@ impl App {
         self.render_static(&mut stdout)?;
         self.render_list_area(&mut stdout)?;
         self.render_footer(&mut stdout)?;
+        self.render_help_popup(&mut stdout)?;
         stdout.flush()?;
         Ok(())
     }
@@ -1156,9 +1167,7 @@ impl App {
         let layout = self.layout();
         if layout.list_row_start > 1 {
             let row = layout.list_row_start - 1;
-            let label = if let Some(Prompt::Help { index }) = self.prompt.as_ref() {
-                help_status_line(*index)
-            } else if self.searching {
+            let label = if self.searching {
                 let suffix = if self.has_matches() {
                     ""
                 } else {
@@ -1294,7 +1303,7 @@ impl App {
                         actions[*choice]
                     )
                 }
-                Prompt::Help { index } => help_status_line(*index),
+                Prompt::Help { .. } => "Shortcut help open".to_string(),
             };
             write_at(
                 stdout,
@@ -1328,6 +1337,49 @@ impl App {
             )?;
         }
         write!(stdout, "\x1b[{};1H\x1b[J", layout.status_row + 1)?;
+        Ok(())
+    }
+
+    fn render_help_popup(&self, stdout: &mut impl Write) -> AppResult<()> {
+        let Some(Prompt::Help { index }) = self.prompt.as_ref() else {
+            return Ok(());
+        };
+
+        let max_entries = self.rows.saturating_sub(8).clamp(1, 12);
+        let lines = help_popup_lines(*index, max_entries);
+        let content_width = lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(self.cols.saturating_sub(4).max(1));
+        let popup_width = (content_width + 4).min(self.cols.max(1));
+        let popup_height = lines.len() + 2;
+        let row_start = self.rows.saturating_sub(popup_height) / 2 + 1;
+        let col_start = self.cols.saturating_sub(popup_width) / 2 + 1;
+        let inner_width = popup_width.saturating_sub(2);
+
+        let top = format!("+{}+", "-".repeat(inner_width));
+        write_at(stdout, row_start, col_start, &top, false)?;
+
+        for (offset, line) in lines.iter().enumerate() {
+            let line = truncate(line, inner_width.saturating_sub(2));
+            let padded = format!(
+                "| {:<width$} |",
+                line,
+                width = inner_width.saturating_sub(2)
+            );
+            write_at(stdout, row_start + offset + 1, col_start, &padded, false)?;
+        }
+
+        let bottom = format!("+{}+", "-".repeat(inner_width));
+        write_at(
+            stdout,
+            row_start + popup_height - 1,
+            col_start,
+            &bottom,
+            false,
+        )?;
         Ok(())
     }
 
@@ -1693,9 +1745,9 @@ mod tests {
     use super::{
         App, Prompt, SHORTCUTS, Session, VisibleRow, arrange_sessions, build_visible_rows,
         bulk_pin_target_state, first_session_row_position, format_relative_activity,
-        help_status_line, next_help_index, pinned_names_from_sessions, prune_selected_sessions,
-        selected_count_for_group, session_name_matches, shortcut_help_line,
-        toggle_selection_for_group, toggle_selection_for_rows, write_pinned_names,
+        help_popup_lines, next_help_index, pinned_names_from_sessions, prune_selected_sessions,
+        selected_count_for_group, session_name_matches, toggle_selection_for_group,
+        toggle_selection_for_rows, write_pinned_names,
     };
     use crate::groups::{Group, GroupState};
     use std::collections::BTreeSet;
@@ -2012,8 +2064,7 @@ mod tests {
     #[test]
     fn shortcut_help_includes_question_mark_entry() {
         assert!(SHORTCUTS.iter().any(|(key, _)| *key == "?"));
-        assert!(shortcut_help_line(0).contains(": "));
-        assert!(help_status_line(0).starts_with("HELP 1/"));
+        assert_eq!(help_popup_lines(0, 4).first().unwrap(), "Shortcuts");
     }
 
     #[test]
@@ -2035,5 +2086,13 @@ mod tests {
 
         app.handle_prompt(0x1b).unwrap();
         assert!(app.prompt.is_none());
+    }
+
+    #[test]
+    fn shortcut_help_popup_marks_current_entry() {
+        let lines = help_popup_lines(1, 3);
+
+        assert!(lines.iter().any(|line| line.starts_with("> g/G")));
+        assert!(lines.last().unwrap().contains("Esc close"));
     }
 }
