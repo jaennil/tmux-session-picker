@@ -1,12 +1,16 @@
 use std::env;
 use std::error::Error;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+mod groups;
+
+use groups::GroupState;
 
 type AppResult<T> = Result<T, Box<dyn Error>>;
 
@@ -19,158 +23,99 @@ struct Session {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct MouseEvent {
-    button: u16,
-    col: usize,
-    row: usize,
-    pressed: bool,
+enum VisibleRow {
+    Group(usize),
+    Session(usize),
 }
 
-enum InputEvent {
-    Key(u8),
-    Mouse(MouseEvent),
-    Ignore,
-}
+fn build_visible_rows(
+    sessions: &[Session],
+    groups: &GroupState,
+    query: &str,
+    ungrouped_collapsed: bool,
+) -> Vec<VisibleRow> {
+    let searching = !query.is_empty();
+    let mut rows = Vec::new();
 
-fn parse_sgr_mouse_body(input: &[u8]) -> Option<MouseEvent> {
-    if !input.starts_with(b"[<") {
-        return None;
-    }
+    for (group_index, group) in groups.groups.iter().enumerate() {
+        let group_matches = session_name_matches(&group.name, query);
+        let matching_sessions = sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, session)| groups.group_for_session(&session.name) == Some(group_index))
+            .filter(|(_, session)| group_matches || session_name_matches(&session.name, query))
+            .map(|(session_index, _)| session_index)
+            .collect::<Vec<_>>();
 
-    let (&terminator, body) = input[2..].split_last()?;
-    if terminator != b'M' && terminator != b'm' {
-        return None;
-    }
-
-    let body = std::str::from_utf8(body).ok()?;
-    let mut parts = body.split(';');
-    let button = parts.next()?.parse().ok()?;
-    let col = parts.next()?.parse().ok()?;
-    let row = parts.next()?.parse().ok()?;
-    if parts.next().is_some() || col == 0 || row == 0 {
-        return None;
-    }
-
-    Some(MouseEvent {
-        button,
-        col,
-        row,
-        pressed: terminator == b'M',
-    })
-}
-
-fn parse_x10_mouse_body(input: &[u8]) -> Option<MouseEvent> {
-    if input.len() != 5 || !input.starts_with(b"[M") {
-        return None;
-    }
-
-    let button = u16::from(input[2]).checked_sub(32)?;
-    let col = usize::from(input[3]).checked_sub(32)?;
-    let row = usize::from(input[4]).checked_sub(32)?;
-    if col == 0 || row == 0 {
-        return None;
-    }
-
-    Some(MouseEvent {
-        button,
-        col,
-        row,
-        pressed: button & 0b11 != 0b11,
-    })
-}
-
-fn parse_mouse_escape(input: &[u8]) -> Option<MouseEvent> {
-    if !input.starts_with(b"\x1b") {
-        return None;
-    }
-    let body = &input[1..];
-    parse_sgr_mouse_body(body).or_else(|| parse_x10_mouse_body(body))
-}
-
-fn session_index_for_mouse_row(
-    mouse_row: usize,
-    list_row_start: usize,
-    list_height: usize,
-    top: usize,
-    matches: &[usize],
-) -> Option<usize> {
-    let offset = mouse_row.checked_sub(list_row_start)?;
-    if offset >= list_height {
-        return None;
-    }
-    matches.get(top.checked_add(offset)?).copied()
-}
-
-fn input_is_ready(fd: RawFd, timeout_ms: i32) -> io::Result<bool> {
-    let mut poll_fd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(result > 0 && poll_fd.revents & libc::POLLIN != 0)
-}
-
-fn read_fd_byte(fd: RawFd) -> io::Result<u8> {
-    let mut byte = 0_u8;
-    loop {
-        let result = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
-        if result == 1 {
-            return Ok(byte);
-        }
-        if result == 0 {
-            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
-        }
-
-        let err = io::Error::last_os_error();
-        if err.kind() != io::ErrorKind::Interrupted {
-            return Err(err);
-        }
-    }
-}
-
-fn read_input_event(fd: RawFd) -> io::Result<InputEvent> {
-    let byte = read_fd_byte(fd)?;
-    if byte != 0x1b {
-        return Ok(InputEvent::Key(byte));
-    }
-
-    let mut sequence = vec![byte];
-    while sequence.len() < 32 && input_is_ready(fd, 80)? {
-        let byte = read_fd_byte(fd)?;
-        sequence.push(byte);
-        if sequence.starts_with(b"\x1b[M") && sequence.len() == 6 {
-            break;
-        }
-        if sequence.starts_with(b"\x1b[<") && (byte == b'M' || byte == b'm') {
-            break;
+        if !searching || group_matches || !matching_sessions.is_empty() {
+            rows.push(VisibleRow::Group(group_index));
+            if searching || !group.collapsed {
+                rows.extend(matching_sessions.into_iter().map(VisibleRow::Session));
+            }
         }
     }
 
-    if sequence.len() > 1 && parse_mouse_escape(&sequence).is_none() {
-        return Ok(InputEvent::Ignore);
+    let ungrouped_index = groups.groups.len();
+    let ungrouped_matches = session_name_matches(groups::UNGROUPED_NAME, query);
+    let matching_sessions = sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, session)| groups.group_for_session(&session.name).is_none())
+        .filter(|(_, session)| ungrouped_matches || session_name_matches(&session.name, query))
+        .map(|(session_index, _)| session_index)
+        .collect::<Vec<_>>();
+
+    if !searching || ungrouped_matches || !matching_sessions.is_empty() {
+        rows.push(VisibleRow::Group(ungrouped_index));
+        if searching || !ungrouped_collapsed {
+            rows.extend(matching_sessions.into_iter().map(VisibleRow::Session));
+        }
     }
 
-    Ok(parse_mouse_escape(&sequence)
-        .map(InputEvent::Mouse)
-        .unwrap_or(InputEvent::Key(0x1b)))
+    rows
+}
+
+fn first_session_row_position(rows: &[VisibleRow]) -> usize {
+    rows.iter()
+        .position(|row| matches!(row, VisibleRow::Session(_)))
+        .unwrap_or(0)
 }
 
 struct App {
     sessions: Vec<Session>,
+    groups: GroupState,
     selected: usize,
     top: usize,
     rows: usize,
     cols: usize,
     pin_file: PathBuf,
+    group_file: PathBuf,
     tmux_socket_name: Option<String>,
     tmux_socket_path: Option<String>,
     status: String,
     query: String,
     searching: bool,
+    ungrouped_collapsed: bool,
+    prompt: Option<Prompt>,
+}
+
+#[derive(Clone, Copy)]
+enum NameAction {
+    Create,
+    Rename(usize),
+    CreateAndMove(usize),
+}
+
+enum Prompt {
+    Name {
+        label: &'static str,
+        value: String,
+        action: NameAction,
+    },
+    Move {
+        session_index: usize,
+        choice: usize,
+    },
 }
 
 struct Layout {
@@ -187,26 +132,37 @@ impl App {
         let tmux_socket_name = env::var("TMUX_SOCKET_NAME").ok();
         let tmux_socket_path = env::var("TMUX_SOCKET_PATH").ok();
         let pin_file = pin_file_path();
+        let group_file = group_file_path();
         let (rows, cols) = terminal_size().unwrap_or((24, 80));
         let sessions = load_sessions(&pin_file, &tmux_socket_name, &tmux_socket_path)?;
-
-        let selected = sessions
+        let groups =
+            GroupState::load(&group_file).map_err(|err| format!("failed to load groups: {err}"))?;
+        let current_session = sessions
             .iter()
             .position(|session| session.is_current)
+            .unwrap_or(0);
+        let visible_rows = build_visible_rows(&sessions, &groups, "", false);
+        let selected = visible_rows
+            .iter()
+            .position(|row| *row == VisibleRow::Session(current_session))
             .unwrap_or(0);
 
         Ok(Self {
             sessions,
+            groups,
             selected,
             top: 0,
             rows,
             cols,
             pin_file,
+            group_file,
             tmux_socket_name,
             tmux_socket_path,
             status: String::new(),
             query: String::new(),
             searching: false,
+            ungrouped_collapsed: false,
+            prompt: None,
         })
     }
 
@@ -214,42 +170,30 @@ impl App {
         self.ensure_visible();
         self.render_full()?;
 
-        let stdin_fd = io::stdin().as_raw_fd();
+        let mut stdin = io::stdin();
+        let mut byte = [0_u8; 1];
 
         loop {
-            let previous_selected = self.selected;
-            let previous_top = self.top;
-            let previous_status = self.status.clone();
-            let mut redraw_full = false;
+            stdin.read_exact(&mut byte)?;
 
-            let input = read_input_event(stdin_fd)?;
-            if let InputEvent::Mouse(mouse) = input {
-                if self.handle_mouse(mouse) {
-                    self.switch_selected()?;
-                    break;
-                }
+            if self.prompt.is_some() {
+                self.handle_prompt(byte[0])?;
                 self.ensure_visible();
-                self.render_incremental(previous_selected, previous_top, &previous_status)?;
+                self.render_full()?;
                 continue;
             }
-            if let InputEvent::Ignore = input {
-                continue;
-            }
-            let InputEvent::Key(key) = input else {
-                unreachable!();
-            };
 
             if self.searching {
-                match key {
-                    b'\r' | b'\n' => {
-                        if self.has_matches() {
-                            self.switch_selected()?;
-                            break;
-                        }
-                    }
+                match byte[0] {
+                    b'\r' | b'\n' if self.activate_selected()? => break,
+                    b'\r' | b'\n' => {}
                     0x1b => {
+                        let selected_row = self.selected_row();
                         self.query.clear();
                         self.searching = false;
+                        if let Some(row) = selected_row {
+                            self.select_row(row);
+                        }
                     }
                     0x03 => break,
                     0x7f | 0x08 => {
@@ -268,173 +212,197 @@ impl App {
                 continue;
             }
 
-            match key {
+            match byte[0] {
                 b'j' => self.move_down(),
                 b'k' => self.move_up(),
                 b'g' => self.jump_first(),
                 b'G' => self.jump_last(),
                 b'/' => {
                     self.searching = true;
-                    redraw_full = true;
+                    self.status.clear();
                 }
-                b'p' => {
-                    self.toggle_pin()?;
-                    redraw_full = true;
-                }
-                b'x' => {
-                    self.kill_selected()?;
-                    redraw_full = true;
-                }
+                b'n' => self.begin_create_group(),
+                b'm' => self.begin_move_session(),
+                b'r' => self.begin_rename_group(),
+                b'd' => self.delete_selected_group()?,
+                b'h' => self.collapse_selected()?,
+                b'l' => self.expand_selected()?,
+                b'p' => self.toggle_pin()?,
+                b'x' => self.kill_selected()?,
                 b'J' => self.reorder_down()?,
                 b'K' => self.reorder_up()?,
-                b'\r' | b'\n' => {
-                    self.switch_selected()?;
-                    break;
-                }
+                b'\r' | b'\n' if self.activate_selected()? => break,
+                b'\r' | b'\n' => {}
                 b'q' | 0x1b | 0x03 => break,
                 _ => {}
             }
 
             self.ensure_visible();
-            if redraw_full {
-                self.render_full()?;
-            } else {
-                self.render_incremental(previous_selected, previous_top, &previous_status)?;
-            }
+            self.render_full()?;
         }
 
         Ok(())
     }
 
-    fn handle_mouse(&mut self, event: MouseEvent) -> bool {
-        let left_button = event.button & 0b11 == 0 && event.button & 0b100_0000 == 0;
-        if !event.pressed || !left_button {
-            return false;
-        }
+    fn visible_rows(&self) -> Vec<VisibleRow> {
+        build_visible_rows(
+            &self.sessions,
+            &self.groups,
+            &self.query,
+            self.ungrouped_collapsed,
+        )
+    }
 
-        let layout = self.layout();
-        let matches = self.matching_indices();
-        if let Some(session_index) = session_index_for_mouse_row(
-            event.row,
-            layout.list_row_start,
-            self.visible_list_height(),
-            self.top,
-            &matches,
-        ) {
-            self.selected = session_index;
-            return true;
+    fn selected_row(&self) -> Option<VisibleRow> {
+        self.visible_rows().get(self.selected).copied()
+    }
+
+    fn selected_session_index(&self) -> Option<usize> {
+        match self.selected_row() {
+            Some(VisibleRow::Session(index)) => Some(index),
+            _ => None,
         }
-        false
+    }
+
+    fn selected_group_index(&self) -> Option<usize> {
+        match self.selected_row() {
+            Some(VisibleRow::Group(index)) => Some(index),
+            _ => None,
+        }
+    }
+
+    fn select_row(&mut self, target: VisibleRow) {
+        if let Some(index) = self.visible_rows().iter().position(|row| *row == target) {
+            self.selected = index;
+        }
     }
 
     fn move_up(&mut self) {
-        let matches = self.matching_indices();
-        if let Some(position) = matches.iter().position(|index| *index == self.selected)
-            && position > 0
-        {
-            self.selected = matches[position - 1];
+        if self.selected > 0 {
+            self.selected -= 1;
         }
     }
 
     fn move_down(&mut self) {
-        let matches = self.matching_indices();
-        if let Some(position) = matches.iter().position(|index| *index == self.selected)
-            && position + 1 < matches.len()
-        {
-            self.selected = matches[position + 1];
+        if self.selected + 1 < self.visible_rows().len() {
+            self.selected += 1;
         }
     }
 
     fn jump_first(&mut self) {
-        if let Some(index) = self.matching_indices().first() {
-            self.selected = *index;
-        }
+        self.selected = 0;
     }
 
     fn jump_last(&mut self) {
-        if let Some(index) = self.matching_indices().last() {
-            self.selected = *index;
-        }
-    }
-
-    fn matching_indices(&self) -> Vec<usize> {
-        self.sessions
-            .iter()
-            .enumerate()
-            .filter_map(|(index, session)| {
-                session_name_matches(&session.name, &self.query).then_some(index)
-            })
-            .collect()
+        self.selected = self.visible_rows().len().saturating_sub(1);
     }
 
     fn has_matches(&self) -> bool {
-        self.sessions
-            .iter()
-            .any(|session| session_name_matches(&session.name, &self.query))
+        !self.visible_rows().is_empty()
     }
 
     fn select_first_match(&mut self) {
-        let matches = self.matching_indices();
-        if !matches.contains(&self.selected)
-            && let Some(index) = matches.first()
-        {
-            self.selected = *index;
-        }
+        self.selected = first_session_row_position(&self.visible_rows());
         self.top = 0;
     }
 
     fn reorder_up(&mut self) -> AppResult<()> {
-        if !self.current().pinned {
+        if let Some(group_index) = self.selected_group_index() {
+            if group_index >= self.groups.groups.len() {
+                self.status = "Ungrouped cannot be reordered".to_string();
+            } else if let Some(new_index) = self.groups.move_group(group_index, -1) {
+                self.write_groups()?;
+                self.select_row(VisibleRow::Group(new_index));
+                self.status = "Moved group up".to_string();
+            } else {
+                self.status = "Group is already first".to_string();
+            }
+            return Ok(());
+        }
+
+        let Some(session_index) = self.selected_session_index() else {
+            return Ok(());
+        };
+        if !self.sessions[session_index].pinned {
             self.status = "Pin session first".to_string();
             return Ok(());
         }
-
-        if self.selected == 0 {
+        let group_index = self
+            .groups
+            .group_for_session(&self.sessions[session_index].name);
+        let previous = (0..session_index).rev().find(|index| {
+            self.sessions[*index].pinned
+                && self.groups.group_for_session(&self.sessions[*index].name) == group_index
+        });
+        let Some(previous) = previous else {
             self.status = "Pinned session is already first".to_string();
             return Ok(());
-        }
+        };
 
-        self.sessions.swap(self.selected, self.selected - 1);
-        self.selected -= 1;
+        let name = self.sessions[session_index].name.clone();
+        self.sessions.swap(session_index, previous);
         self.write_pins()?;
-        self.status = format!("Moved {} up", self.current().name);
+        self.select_session_by_name(&name);
+        self.status = format!("Moved {name} up");
         Ok(())
     }
 
     fn reorder_down(&mut self) -> AppResult<()> {
-        if !self.current().pinned {
+        if let Some(group_index) = self.selected_group_index() {
+            if group_index >= self.groups.groups.len() {
+                self.status = "Ungrouped cannot be reordered".to_string();
+            } else if let Some(new_index) = self.groups.move_group(group_index, 1) {
+                self.write_groups()?;
+                self.select_row(VisibleRow::Group(new_index));
+                self.status = "Moved group down".to_string();
+            } else {
+                self.status = "Group is already last".to_string();
+            }
+            return Ok(());
+        }
+
+        let Some(session_index) = self.selected_session_index() else {
+            return Ok(());
+        };
+        if !self.sessions[session_index].pinned {
             self.status = "Pin session first".to_string();
             return Ok(());
         }
-
-        let pinned_count = self.pinned_count();
-        if self.selected + 1 >= pinned_count {
+        let group_index = self
+            .groups
+            .group_for_session(&self.sessions[session_index].name);
+        let next = (session_index + 1..self.sessions.len()).find(|index| {
+            self.sessions[*index].pinned
+                && self.groups.group_for_session(&self.sessions[*index].name) == group_index
+        });
+        let Some(next) = next else {
             self.status = "Pinned session is already last".to_string();
             return Ok(());
-        }
+        };
 
-        self.sessions.swap(self.selected, self.selected + 1);
-        self.selected += 1;
+        let name = self.sessions[session_index].name.clone();
+        self.sessions.swap(session_index, next);
         self.write_pins()?;
-        self.status = format!("Moved {} down", self.current().name);
+        self.select_session_by_name(&name);
+        self.status = format!("Moved {name} down");
         Ok(())
     }
 
     fn toggle_pin(&mut self) -> AppResult<()> {
-        let current_name = self.current().name.clone();
-        let was_pinned = self.current().pinned;
+        let Some(session_index) = self.selected_session_index() else {
+            self.status = "Select a session to pin it".to_string();
+            return Ok(());
+        };
+        let current_name = self.sessions[session_index].name.clone();
+        let was_pinned = self.sessions[session_index].pinned;
 
-        if let Some(session) = self.sessions.get_mut(self.selected) {
+        if let Some(session) = self.sessions.get_mut(session_index) {
             session.pinned = !session.pinned;
         }
 
         let pinned_names = pinned_names_from_sessions(&self.sessions);
         arrange_sessions(&mut self.sessions, &pinned_names);
-        self.selected = self
-            .sessions
-            .iter()
-            .position(|session| session.name == current_name)
-            .unwrap_or(0);
+        self.select_session_by_name(&current_name);
         self.write_pins()?;
         self.status = if was_pinned {
             format!("Unpinned {current_name}")
@@ -445,21 +413,27 @@ impl App {
     }
 
     fn kill_selected(&mut self) -> AppResult<()> {
-        if self.current().is_current {
+        let Some(session_index) = self.selected_session_index() else {
+            self.status = "Select a session to kill it".to_string();
+            return Ok(());
+        };
+        if self.sessions[session_index].is_current {
             self.status = "Cannot kill current session".to_string();
             return Ok(());
         }
 
-        let session_name = self.current().name.clone();
-        let next_selected_name = self
-            .sessions
-            .get(self.selected + 1)
-            .or_else(|| {
-                self.selected
-                    .checked_sub(1)
-                    .and_then(|index| self.sessions.get(index))
-            })
-            .map(|session| session.name.clone());
+        let session_name = self.sessions[session_index].name.clone();
+        let rows = self.visible_rows();
+        let next_selected_name = rows
+            .iter()
+            .skip(self.selected + 1)
+            .chain(rows[..self.selected].iter().rev())
+            .find_map(|row| match row {
+                VisibleRow::Session(index) if *index != session_index => {
+                    Some(self.sessions[*index].name.clone())
+                }
+                _ => None,
+            });
         tmux_status(
             &self.tmux_socket_name,
             &self.tmux_socket_path,
@@ -471,42 +445,270 @@ impl App {
         Ok(())
     }
 
-    fn switch_selected(&mut self) -> AppResult<()> {
-        let session_name = self.current().name.clone();
+    fn activate_selected(&mut self) -> AppResult<bool> {
+        let Some(row) = self.selected_row() else {
+            return Ok(false);
+        };
+        if let VisibleRow::Group(group_index) = row {
+            self.toggle_group(group_index)?;
+            return Ok(false);
+        }
+
+        let VisibleRow::Session(session_index) = row else {
+            return Ok(false);
+        };
+        let session_name = self.sessions[session_index].name.clone();
         tmux_status(
             &self.tmux_socket_name,
             &self.tmux_socket_path,
             &["switch-client", "-t", &session_name],
         )?;
+        Ok(true)
+    }
+
+    fn begin_create_group(&mut self) {
+        self.prompt = Some(Prompt::Name {
+            label: "NEW GROUP",
+            value: String::new(),
+            action: NameAction::Create,
+        });
+    }
+
+    fn begin_rename_group(&mut self) {
+        let Some(group_index) = self.selected_group_index() else {
+            self.status = "Select a group to rename it".to_string();
+            return;
+        };
+        let Some(group) = self.groups.groups.get(group_index) else {
+            self.status = "Ungrouped cannot be renamed".to_string();
+            return;
+        };
+        self.prompt = Some(Prompt::Name {
+            label: "RENAME GROUP",
+            value: group.name.clone(),
+            action: NameAction::Rename(group_index),
+        });
+    }
+
+    fn begin_move_session(&mut self) {
+        let Some(session_index) = self.selected_session_index() else {
+            self.status = "Select a session to move it".to_string();
+            return;
+        };
+        let choice = self
+            .groups
+            .group_for_session(&self.sessions[session_index].name)
+            .unwrap_or(self.groups.groups.len());
+        self.prompt = Some(Prompt::Move {
+            session_index,
+            choice,
+        });
+    }
+
+    fn handle_prompt(&mut self, byte: u8) -> AppResult<()> {
+        let Some(mut prompt) = self.prompt.take() else {
+            return Ok(());
+        };
+
+        match &mut prompt {
+            Prompt::Name { value, action, .. } => match byte {
+                b'\r' | b'\n' => {
+                    let result = self.submit_group_name(value, *action);
+                    if let Err(err) = result {
+                        self.status = err;
+                        self.prompt = Some(prompt);
+                    }
+                }
+                0x1b | 0x03 => self.status = "Cancelled".to_string(),
+                0x7f | 0x08 => {
+                    value.pop();
+                    self.prompt = Some(prompt);
+                }
+                value_byte if value_byte.is_ascii_graphic() || value_byte == b' ' => {
+                    value.push(char::from(value_byte));
+                    self.prompt = Some(prompt);
+                }
+                _ => self.prompt = Some(prompt),
+            },
+            Prompt::Move {
+                session_index,
+                choice,
+            } => {
+                let option_count = self.groups.groups.len() + 2;
+                match byte {
+                    b'j' => *choice = (*choice + 1).min(option_count - 1),
+                    b'k' => *choice = choice.saturating_sub(1),
+                    b'g' => *choice = 0,
+                    b'G' => *choice = option_count - 1,
+                    b'\r' | b'\n' => {
+                        let session_index = *session_index;
+                        let choice = *choice;
+                        if choice < self.groups.groups.len() {
+                            self.move_session_to(session_index, Some(choice))?;
+                            return Ok(());
+                        }
+                        if choice == self.groups.groups.len() {
+                            self.move_session_to(session_index, None)?;
+                            return Ok(());
+                        }
+                        self.prompt = Some(Prompt::Name {
+                            label: "NEW GROUP",
+                            value: String::new(),
+                            action: NameAction::CreateAndMove(session_index),
+                        });
+                        return Ok(());
+                    }
+                    0x1b | 0x03 => {
+                        self.status = "Cancelled".to_string();
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                self.prompt = Some(prompt);
+            }
+        }
         Ok(())
     }
 
-    fn current(&self) -> &Session {
-        &self.sessions[self.selected]
+    fn submit_group_name(&mut self, value: &str, action: NameAction) -> Result<(), String> {
+        match action {
+            NameAction::Create => {
+                let group_index = self.groups.add_group(value)?;
+                self.groups.save(&self.group_file)?;
+                self.query.clear();
+                self.select_row(VisibleRow::Group(group_index));
+                self.status = format!("Created {}", self.groups.groups[group_index].name);
+            }
+            NameAction::Rename(group_index) => {
+                self.groups.rename_group(group_index, value)?;
+                self.groups.save(&self.group_file)?;
+                self.status = format!("Renamed group to {}", self.groups.groups[group_index].name);
+            }
+            NameAction::CreateAndMove(session_index) => {
+                let group_index = self.groups.add_group(value)?;
+                let session_name = self.sessions[session_index].name.clone();
+                self.groups.move_session(&session_name, Some(group_index));
+                self.groups.save(&self.group_file)?;
+                self.select_session_by_name(&session_name);
+                self.status = format!(
+                    "Moved {session_name} to {}",
+                    self.groups.groups[group_index].name
+                );
+            }
+        }
+        Ok(())
     }
 
-    fn pinned_count(&self) -> usize {
-        self.sessions
+    fn move_session_to(
+        &mut self,
+        session_index: usize,
+        group_index: Option<usize>,
+    ) -> AppResult<()> {
+        let session_name = self.sessions[session_index].name.clone();
+        self.groups.move_session(&session_name, group_index);
+        if let Some(group) = group_index.and_then(|index| self.groups.groups.get_mut(index)) {
+            group.collapsed = false;
+        } else {
+            self.ungrouped_collapsed = false;
+        }
+        self.write_groups()?;
+        self.select_session_by_name(&session_name);
+        let destination = group_index
+            .and_then(|index| self.groups.groups.get(index))
+            .map(|group| group.name.as_str())
+            .unwrap_or(groups::UNGROUPED_NAME);
+        self.status = format!("Moved {session_name} to {destination}");
+        Ok(())
+    }
+
+    fn delete_selected_group(&mut self) -> AppResult<()> {
+        let Some(group_index) = self.selected_group_index() else {
+            self.status = "Select a group to delete it".to_string();
+            return Ok(());
+        };
+        if group_index >= self.groups.groups.len() {
+            self.status = "Ungrouped cannot be deleted".to_string();
+            return Ok(());
+        }
+        let name = self.groups.groups[group_index].name.clone();
+        self.groups
+            .delete_group(group_index)
+            .map_err(|err| -> Box<dyn Error> { err.into() })?;
+        self.write_groups()?;
+        self.selected = self
+            .selected
+            .min(self.visible_rows().len().saturating_sub(1));
+        self.status = format!("Deleted {name}; sessions are ungrouped");
+        Ok(())
+    }
+
+    fn collapse_selected(&mut self) -> AppResult<()> {
+        let group_index = match self.selected_row() {
+            Some(VisibleRow::Group(index)) => index,
+            Some(VisibleRow::Session(index)) => self
+                .groups
+                .group_for_session(&self.sessions[index].name)
+                .unwrap_or(self.groups.groups.len()),
+            None => return Ok(()),
+        };
+        self.set_group_collapsed(group_index, true)
+    }
+
+    fn expand_selected(&mut self) -> AppResult<()> {
+        let group_index = match self.selected_row() {
+            Some(VisibleRow::Group(index)) => index,
+            Some(VisibleRow::Session(index)) => self
+                .groups
+                .group_for_session(&self.sessions[index].name)
+                .unwrap_or(self.groups.groups.len()),
+            None => return Ok(()),
+        };
+        self.set_group_collapsed(group_index, false)
+    }
+
+    fn toggle_group(&mut self, group_index: usize) -> AppResult<()> {
+        let collapsed = if group_index < self.groups.groups.len() {
+            !self.groups.groups[group_index].collapsed
+        } else {
+            !self.ungrouped_collapsed
+        };
+        self.set_group_collapsed(group_index, collapsed)
+    }
+
+    fn set_group_collapsed(&mut self, group_index: usize, collapsed: bool) -> AppResult<()> {
+        if let Some(group) = self.groups.groups.get_mut(group_index) {
+            group.collapsed = collapsed;
+            self.write_groups()?;
+        } else {
+            self.ungrouped_collapsed = collapsed;
+        }
+        self.select_row(VisibleRow::Group(group_index));
+        Ok(())
+    }
+
+    fn select_session_by_name(&mut self, name: &str) {
+        if let Some(session_index) = self
+            .sessions
             .iter()
-            .take_while(|session| session.pinned)
-            .count()
+            .position(|session| session.name == name)
+        {
+            self.select_row(VisibleRow::Session(session_index));
+        }
     }
 
     fn ensure_visible(&mut self) {
-        let viewport = self.viewport_height();
-        let Some(position) = self
-            .matching_indices()
-            .iter()
-            .position(|index| *index == self.selected)
-        else {
+        let row_count = self.visible_rows().len();
+        if row_count == 0 {
+            self.selected = 0;
             self.top = 0;
             return;
-        };
-
-        if position < self.top {
-            self.top = position;
-        } else if position >= self.top + viewport {
-            self.top = position + 1 - viewport;
+        }
+        self.selected = self.selected.min(row_count - 1);
+        let viewport = self.viewport_height();
+        if self.selected < self.top {
+            self.top = self.selected;
+        } else if self.selected >= self.top + viewport {
+            self.top = self.selected + 1 - viewport;
         }
     }
 
@@ -516,8 +718,7 @@ impl App {
     }
 
     fn visible_list_height(&self) -> usize {
-        self.viewport_height()
-            .min(self.matching_indices().len().max(1))
+        self.viewport_height().min(self.visible_rows().len().max(1))
     }
 
     fn layout(&self) -> Layout {
@@ -525,6 +726,12 @@ impl App {
             .sessions
             .iter()
             .map(|session| session.name.chars().count())
+            .chain(
+                self.groups
+                    .groups
+                    .iter()
+                    .map(|group| group.name.chars().count()),
+            )
             .max()
             .unwrap_or(8);
         let min_name_width = 16;
@@ -565,31 +772,6 @@ impl App {
         Ok(())
     }
 
-    fn render_incremental(
-        &self,
-        previous_selected: usize,
-        previous_top: usize,
-        previous_status: &str,
-    ) -> AppResult<()> {
-        let mut stdout = io::stdout().lock();
-
-        if previous_top != self.top {
-            self.render_list_area(&mut stdout)?;
-            self.render_footer(&mut stdout)?;
-        } else {
-            self.render_session_row(&mut stdout, previous_selected)?;
-            if previous_selected != self.selected {
-                self.render_session_row(&mut stdout, self.selected)?;
-            }
-            if previous_status != self.status {
-                self.render_footer(&mut stdout)?;
-            }
-        }
-
-        stdout.flush()?;
-        Ok(())
-    }
-
     fn render_static(&self, stdout: &mut impl Write) -> AppResult<()> {
         let layout = self.layout();
         if layout.list_row_start > 1 {
@@ -602,7 +784,8 @@ impl App {
                 };
                 format!("Search: /{}{suffix}", self.query)
             } else {
-                "Press / to search sessions".to_string()
+                "Enter open/toggle  h/l fold  n new  m move  r rename  d delete  / search"
+                    .to_string()
             };
             write_at(
                 stdout,
@@ -616,73 +799,67 @@ impl App {
     }
 
     fn render_list_area(&self, stdout: &mut impl Write) -> AppResult<()> {
-        let matches = self.matching_indices();
+        let rows = self.visible_rows();
         for visible_row in 0..self.visible_list_height() {
-            let session_index = matches.get(self.top + visible_row).copied();
-            self.render_session_row_at(stdout, visible_row, session_index)?;
+            let row = rows.get(self.top + visible_row).copied();
+            self.render_row_at(stdout, visible_row, row)?;
         }
         Ok(())
     }
 
-    fn render_session_row(&self, stdout: &mut impl Write, session_index: usize) -> AppResult<()> {
-        let Some(position) = self
-            .matching_indices()
-            .iter()
-            .position(|index| *index == session_index)
-        else {
-            return Ok(());
-        };
-        if position < self.top || position >= self.top + self.viewport_height() {
-            return Ok(());
-        }
-
-        let visible_row = position - self.top;
-        self.render_session_row_at(stdout, visible_row, Some(session_index))
-    }
-
-    fn render_session_row_at(
+    fn render_row_at(
         &self,
         stdout: &mut impl Write,
         visible_row: usize,
-        session_index: Option<usize>,
+        visible: Option<VisibleRow>,
     ) -> AppResult<()> {
         let layout = self.layout();
         let row = layout.list_row_start + visible_row;
+        let selected = self.top + visible_row == self.selected;
+        let pointer = if selected { ">" } else { " " };
 
-        if let Some((session_index, session)) =
-            session_index.and_then(|index| self.sessions.get(index).map(|session| (index, session)))
-        {
-            let pointer = if session_index == self.selected {
-                ">"
-            } else {
-                " "
-            };
-            let pin = if session.pinned { "!" } else { " " };
-            let current = if session.is_current { "*" } else { "" };
-            let last = format_relative_activity(session.last_activity);
-            let line = format!(
-                "{} {:<name_width$}  {:>activity_width$}  {:^3} {}",
-                pointer,
-                session.name,
-                last,
-                current,
-                pin,
-                name_width = layout.name_width,
-                activity_width = layout.activity_width,
-            );
-            let line = truncate(
-                &line,
-                self.cols.saturating_sub(layout.table_col.saturating_sub(1)),
-            );
-            write_at(
-                stdout,
-                row,
-                layout.table_col,
-                &line,
-                session_index == self.selected,
-            )?;
-        } else {
+        let line = match visible {
+            Some(VisibleRow::Group(group_index)) => {
+                let (name, collapsed) = if let Some(group) = self.groups.groups.get(group_index) {
+                    (group.name.as_str(), group.collapsed)
+                } else {
+                    (groups::UNGROUPED_NAME, self.ungrouped_collapsed)
+                };
+                let count = self
+                    .sessions
+                    .iter()
+                    .filter(|session| {
+                        self.groups.group_for_session(&session.name)
+                            == (group_index < self.groups.groups.len()).then_some(group_index)
+                    })
+                    .count();
+                let marker = if collapsed { "▸" } else { "▼" };
+                format!("{pointer} {marker} {name} ({count})")
+            }
+            Some(VisibleRow::Session(session_index)) => {
+                let session = &self.sessions[session_index];
+                let pin = if session.pinned { "!" } else { " " };
+                let current = if session.is_current { "*" } else { "" };
+                let last = format_relative_activity(session.last_activity);
+                format!(
+                    "{pointer}   {:<name_width$}  {:>activity_width$}  {:^3} {pin}",
+                    session.name,
+                    last,
+                    current,
+                    name_width = layout.name_width,
+                    activity_width = layout.activity_width,
+                )
+            }
+            None => String::new(),
+        };
+        let line = truncate(
+            &line,
+            self.cols.saturating_sub(layout.table_col.saturating_sub(1)),
+        );
+        if line.is_empty() {
             write_row(stdout, row, "", false)?;
+        } else {
+            write_at(stdout, row, layout.table_col, &line, selected)?;
         }
         Ok(())
     }
@@ -690,7 +867,34 @@ impl App {
     fn render_footer(&self, stdout: &mut impl Write) -> AppResult<()> {
         let layout = self.layout();
         write_row(stdout, layout.blank_row, "", false)?;
-        if self.searching {
+        if let Some(prompt) = &self.prompt {
+            let text = match prompt {
+                Prompt::Name { label, value, .. } => format!("{label}: {value}"),
+                Prompt::Move {
+                    session_index,
+                    choice,
+                } => {
+                    let destination = if *choice < self.groups.groups.len() {
+                        self.groups.groups[*choice].name.as_str()
+                    } else if *choice == self.groups.groups.len() {
+                        groups::UNGROUPED_NAME
+                    } else {
+                        "New group..."
+                    };
+                    format!(
+                        "MOVE {} -> [{destination}]  j/k choose  Enter confirm  Esc cancel",
+                        self.sessions[*session_index].name
+                    )
+                }
+            };
+            write_at(
+                stdout,
+                layout.status_row,
+                1,
+                &truncate(&text, self.cols),
+                false,
+            )?;
+        } else if self.searching {
             let suffix = if self.has_matches() {
                 ""
             } else {
@@ -722,21 +926,29 @@ impl App {
         write_pinned_names(&self.pin_file, &pinned_names_from_sessions(&self.sessions))
     }
 
+    fn write_groups(&self) -> AppResult<()> {
+        self.groups.save(&self.group_file).map_err(|err| err.into())
+    }
+
     fn reload_sessions(&mut self, preferred_name: Option<&str>) -> AppResult<()> {
-        let previous_selected = self.selected;
         self.sessions = load_sessions(
             &self.pin_file,
             &self.tmux_socket_name,
             &self.tmux_socket_path,
         )?;
-        self.selected = preferred_name
-            .and_then(|name| {
-                self.sessions
-                    .iter()
-                    .position(|session| session.name == name)
-            })
-            .or_else(|| self.sessions.iter().position(|session| session.is_current))
-            .unwrap_or_else(|| previous_selected.min(self.sessions.len().saturating_sub(1)));
+        let selected_name = preferred_name.map(str::to_string).or_else(|| {
+            self.sessions
+                .iter()
+                .find(|session| session.is_current)
+                .map(|session| session.name.clone())
+        });
+        if let Some(name) = selected_name {
+            self.select_session_by_name(&name);
+        } else {
+            self.selected = self
+                .selected
+                .min(self.visible_rows().len().saturating_sub(1));
+        }
         self.top = self.top.min(self.selected);
         Ok(())
     }
@@ -760,7 +972,7 @@ impl TerminalGuard {
         set_termios(fd, &raw_state)?;
 
         let mut stdout = io::stdout().lock();
-        write!(stdout, "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h")?;
+        write!(stdout, "\x1b[?1049h\x1b[?25l")?;
         stdout.flush()?;
 
         Ok(Self { fd, saved_state })
@@ -771,7 +983,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = set_termios(self.fd, &self.saved_state);
         let mut stdout = io::stdout().lock();
-        let _ = write!(stdout, "\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l");
+        let _ = write!(stdout, "\x1b[?25h\x1b[?1049l");
         let _ = stdout.flush();
     }
 }
@@ -783,6 +995,15 @@ fn pin_file_path() -> PathBuf {
 
     let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".config/tmux/session-pins")
+}
+
+fn group_file_path() -> PathBuf {
+    if let Ok(path) = env::var("TMUX_SESSION_GROUP_FILE") {
+        return PathBuf::from(path);
+    }
+
+    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".config/tmux/session-groups.toml")
 }
 
 fn load_sessions(
@@ -1060,10 +1281,11 @@ fn main() -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, MouseEvent, Session, arrange_sessions, format_relative_activity, parse_mouse_escape,
-        pinned_names_from_sessions, session_index_for_mouse_row, session_name_matches,
+        Session, VisibleRow, arrange_sessions, build_visible_rows, first_session_row_position,
+        format_relative_activity, pinned_names_from_sessions, session_name_matches,
         write_pinned_names,
     };
+    use crate::groups::{Group, GroupState};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1083,22 +1305,6 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("tmux-session-picker-test-{nanos}.{suffix}"))
-    }
-
-    fn app_with_sessions(sessions: Vec<Session>) -> App {
-        App {
-            sessions,
-            selected: 0,
-            top: 0,
-            rows: 24,
-            cols: 80,
-            pin_file: PathBuf::new(),
-            tmux_socket_name: None,
-            tmux_socket_path: None,
-            status: String::new(),
-            query: String::new(),
-            searching: false,
-        }
     }
 
     #[test]
@@ -1167,64 +1373,96 @@ mod tests {
     }
 
     #[test]
-    fn sgr_mouse_parser_decodes_left_click() {
-        let event = parse_mouse_escape(b"\x1b[<0;12;7M").unwrap();
-
-        assert_eq!(event.button, 0);
-        assert_eq!(event.col, 12);
-        assert_eq!(event.row, 7);
-        assert!(event.pressed);
-    }
-
-    #[test]
-    fn legacy_mouse_parser_decodes_left_click() {
-        let event = parse_mouse_escape(b"\x1b[M *'").unwrap();
-
-        assert_eq!(event.button, 0);
-        assert_eq!(event.col, 10);
-        assert_eq!(event.row, 7);
-        assert!(event.pressed);
-    }
-
-    #[test]
-    fn sgr_mouse_parser_rejects_incomplete_sequence() {
-        assert!(parse_mouse_escape(b"\x1b").is_none());
-        assert!(parse_mouse_escape(b"\x1b[<0;12M").is_none());
-    }
-
-    #[test]
-    fn mouse_row_selects_visible_scrolled_session() {
-        let matches = vec![2, 4, 7, 9, 11];
-
-        assert_eq!(session_index_for_mouse_row(8, 8, 3, 1, &matches), Some(4));
-        assert_eq!(session_index_for_mouse_row(10, 8, 3, 1, &matches), Some(9));
-    }
-
-    #[test]
-    fn mouse_row_outside_visible_sessions_is_ignored() {
-        let matches = vec![2, 4];
-
-        assert_eq!(session_index_for_mouse_row(7, 8, 3, 0, &matches), None);
-        assert_eq!(session_index_for_mouse_row(11, 8, 3, 0, &matches), None);
-        assert_eq!(session_index_for_mouse_row(10, 8, 3, 0, &matches), None);
-    }
-
-    #[test]
-    fn mouse_click_selects_and_activates_session_under_cursor() {
-        let mut app = app_with_sessions(vec![
+    fn visible_rows_include_group_headers_and_ungrouped_sessions() {
+        let sessions = vec![
             session("api", 0, false),
-            session("database", 0, false),
-        ]);
-        let layout = app.layout();
+            session("notes", 0, false),
+            session("scratch", 0, false),
+        ];
+        let groups = GroupState {
+            version: 1,
+            groups: vec![
+                Group {
+                    name: "Work".to_string(),
+                    collapsed: false,
+                    sessions: vec!["api".to_string()],
+                },
+                Group {
+                    name: "Personal".to_string(),
+                    collapsed: false,
+                    sessions: vec!["notes".to_string()],
+                },
+            ],
+        };
 
-        let activated = app.handle_mouse(MouseEvent {
-            button: 0,
-            col: 8,
-            row: layout.list_row_start + 1,
-            pressed: true,
-        });
+        assert_eq!(
+            build_visible_rows(&sessions, &groups, "", false),
+            vec![
+                VisibleRow::Group(0),
+                VisibleRow::Session(0),
+                VisibleRow::Group(1),
+                VisibleRow::Session(1),
+                VisibleRow::Group(2),
+                VisibleRow::Session(2),
+            ]
+        );
+    }
 
-        assert!(activated);
-        assert_eq!(app.selected, 1);
+    #[test]
+    fn collapsed_groups_hide_sessions_but_search_reveals_matches() {
+        let sessions = vec![session("api", 0, false), session("database", 0, false)];
+        let groups = GroupState {
+            version: 1,
+            groups: vec![Group {
+                name: "Work".to_string(),
+                collapsed: true,
+                sessions: vec!["api".to_string(), "database".to_string()],
+            }],
+        };
+
+        assert_eq!(
+            build_visible_rows(&sessions, &groups, "", false),
+            vec![VisibleRow::Group(0), VisibleRow::Group(1)]
+        );
+        assert_eq!(
+            build_visible_rows(&sessions, &groups, "data", false),
+            vec![VisibleRow::Group(0), VisibleRow::Session(1)]
+        );
+        assert!(groups.groups[0].collapsed);
+    }
+
+    #[test]
+    fn matching_a_group_name_reveals_all_of_its_sessions() {
+        let sessions = vec![session("api", 0, false), session("database", 0, false)];
+        let groups = GroupState {
+            version: 1,
+            groups: vec![Group {
+                name: "Work".to_string(),
+                collapsed: true,
+                sessions: vec!["api".to_string(), "database".to_string()],
+            }],
+        };
+
+        assert_eq!(
+            build_visible_rows(&sessions, &groups, "work", false),
+            vec![
+                VisibleRow::Group(0),
+                VisibleRow::Session(0),
+                VisibleRow::Session(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn search_selection_skips_group_headers() {
+        let rows = vec![
+            VisibleRow::Group(0),
+            VisibleRow::Session(3),
+            VisibleRow::Session(4),
+        ];
+
+        assert_eq!(first_session_row_position(&rows), 1);
+        assert_eq!(first_session_row_position(&[VisibleRow::Group(0)]), 0);
+        assert_eq!(first_session_row_position(&[]), 0);
     }
 }

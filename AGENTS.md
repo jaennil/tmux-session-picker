@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This repository contains a small Rust 2024 terminal application for selecting tmux sessions. The implementation and unit tests currently live in `src/main.rs`. `Cargo.toml` defines the package, its `libc` dependency, and release optimizations; `Cargo.lock` pins dependency versions. `README.md` documents user-facing controls. Cargo writes build artifacts to `target/`, which must remain untracked.
+This repository contains a small Rust 2024 terminal application for selecting tmux sessions. Application behavior and UI tests live in `src/main.rs`; group persistence and its tests live in `src/groups.rs`. `Cargo.toml` defines dependencies and release optimizations, while `Cargo.lock` pins versions. `README.md` documents user-facing controls. Cargo writes build artifacts to `target/`, which must remain untracked.
 
 Keep terminal interaction, tmux command handling, session ordering, and rendering logic clearly separated within the source file. If the application grows, move cohesive areas into modules under `src/` and keep `main.rs` focused on startup and orchestration.
 
@@ -15,7 +15,7 @@ Keep terminal interaction, tmux command handling, session ordering, and renderin
 - `cargo fmt --check` verifies standard Rust formatting; run `cargo fmt` to apply it.
 - `cargo clippy --all-targets --all-features` reports common correctness and style issues.
 
-The application accepts `TMUX_SOCKET_NAME` or `TMUX_SOCKET_PATH` for alternate tmux servers. Set `TMUX_SESSION_PIN_FILE` to isolate pin-state files during manual testing.
+The application accepts `TMUX_SOCKET_NAME` or `TMUX_SOCKET_PATH` for alternate tmux servers. Set `TMUX_SESSION_PIN_FILE` and `TMUX_SESSION_GROUP_FILE` to isolate state during manual testing.
 
 ## Coding Style & Naming Conventions
 
