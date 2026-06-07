@@ -278,6 +278,35 @@ fn mode_line(
     }
 }
 
+fn session_row_line(
+    pointer: &str,
+    session: &Session,
+    selected_sessions: &BTreeSet<String>,
+    name_width: usize,
+    activity_width: usize,
+) -> String {
+    let pin = if session.pinned { "!" } else { " " };
+    let current = if session.is_current { "*" } else { "" };
+    let last = format_relative_activity(session.last_activity);
+
+    if selected_sessions.is_empty() {
+        return format!(
+            "{pointer}   {:<name_width$}  {:>activity_width$}  {:^3} {pin}",
+            session.name, last, current,
+        );
+    }
+
+    let checkbox = if selected_sessions.contains(&session.name) {
+        "[x]"
+    } else {
+        "[ ]"
+    };
+    format!(
+        "{pointer} {checkbox} {:<name_width$}  {:>activity_width$}  {:^3} {pin}",
+        session.name, last, current,
+    )
+}
+
 fn next_help_index(current: usize, offset: isize) -> usize {
     current
         .checked_add_signed(offset)
@@ -1291,21 +1320,12 @@ impl App {
             }
             Some(VisibleRow::Session(session_index)) => {
                 let session = &self.sessions[session_index];
-                let checkbox = if self.selected_sessions.contains(&session.name) {
-                    "[x]"
-                } else {
-                    "[ ]"
-                };
-                let pin = if session.pinned { "!" } else { " " };
-                let current = if session.is_current { "*" } else { "" };
-                let last = format_relative_activity(session.last_activity);
-                format!(
-                    "{pointer} {checkbox} {:<name_width$}  {:>activity_width$}  {:^3} {pin}",
-                    session.name,
-                    last,
-                    current,
-                    name_width = layout.name_width,
-                    activity_width = layout.activity_width,
+                session_row_line(
+                    pointer,
+                    session,
+                    &self.selected_sessions,
+                    layout.name_width,
+                    layout.activity_width,
                 )
             }
             None => String::new(),
@@ -1859,8 +1879,8 @@ mod tests {
         build_visible_rows, bulk_pin_target_state, first_session_row_position,
         format_relative_activity, help_popup_height, help_popup_lines, mode_line, move_popup_lines,
         next_help_index, pinned_names_from_sessions, prune_selected_sessions,
-        selected_count_for_group, session_name_matches, toggle_selection_for_group,
-        toggle_selection_for_rows, write_pinned_names,
+        selected_count_for_group, session_name_matches, session_row_line,
+        toggle_selection_for_group, toggle_selection_for_rows, write_pinned_names,
     };
     use crate::groups::{Group, GroupState};
     use std::collections::BTreeSet;
@@ -2311,5 +2331,22 @@ mod tests {
             ),
             "MODE input: NEW GROUP: Work_"
         );
+    }
+
+    #[test]
+    fn session_row_hides_checkbox_until_selection_mode() {
+        let api = session("api", 0, false);
+
+        let normal = session_row_line(">", &api, &BTreeSet::new(), 16, 4);
+        assert!(!normal.contains("[ ]"));
+        assert!(!normal.contains("[x]"));
+
+        let selected = BTreeSet::from(["api".to_string()]);
+        let selected_line = session_row_line(">", &api, &selected, 16, 4);
+        assert!(selected_line.contains("[x]"));
+
+        let db = session("db", 0, false);
+        let unselected_line = session_row_line(" ", &db, &selected, 16, 4);
+        assert!(unselected_line.contains("[ ]"));
     }
 }
