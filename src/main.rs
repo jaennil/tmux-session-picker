@@ -776,8 +776,12 @@ impl App {
                 }
                 0x1b | 0x03 => self.status = "Cancelled".to_string(),
                 0x7f | 0x08 => {
-                    value.pop();
-                    self.prompt = Some(prompt);
+                    if value.is_empty() {
+                        self.status = "Cancelled".to_string();
+                    } else {
+                        value.pop();
+                        self.prompt = Some(prompt);
+                    }
                 }
                 value_byte if value_byte.is_ascii_graphic() || value_byte == b' ' => {
                     value.push(char::from(value_byte));
@@ -2195,6 +2199,37 @@ mod tests {
 
         app.handle_prompt(0x1b).unwrap();
         assert!(app.prompt.is_none());
+    }
+
+    #[test]
+    fn empty_name_prompt_backspace_cancels_like_escape() {
+        let mut app = app_with_sessions(vec![session("api", 0, false)]);
+        app.begin_create_group();
+
+        app.handle_prompt(0x7f).unwrap();
+
+        assert!(app.prompt.is_none());
+        assert_eq!(app.status, "Cancelled");
+    }
+
+    #[test]
+    fn non_empty_name_prompt_backspace_deletes_character() {
+        let mut app = app_with_sessions(vec![session("api", 0, false)]);
+        app.prompt = Some(Prompt::Name {
+            label: "NEW GROUP",
+            value: "Work".to_string(),
+            action: NameAction::Create,
+        });
+
+        app.handle_prompt(0x7f).unwrap();
+
+        assert!(matches!(
+            app.prompt,
+            Some(Prompt::Name {
+                ref value,
+                ..
+            }) if value == "Wor"
+        ));
     }
 
     #[test]
