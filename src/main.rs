@@ -251,7 +251,9 @@ fn mode_line(
     selected_count: usize,
 ) -> String {
     match prompt {
-        Some(Prompt::Name { label, .. }) => format!("MODE input: {label}"),
+        Some(Prompt::Name { label, value, .. }) => {
+            format!("MODE input: {label}: {value}_")
+        }
         Some(Prompt::Move { session_names, .. }) => {
             format!(
                 "MODE move: {} sessions  j/k choose  Enter confirm",
@@ -1849,12 +1851,12 @@ fn main() -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, Prompt, SHORTCUTS, Session, VisibleRow, arrange_sessions, build_visible_rows,
-        bulk_pin_target_state, first_session_row_position, format_relative_activity,
-        help_popup_height, help_popup_lines, mode_line, move_popup_lines, next_help_index,
-        pinned_names_from_sessions, prune_selected_sessions, selected_count_for_group,
-        session_name_matches, toggle_selection_for_group, toggle_selection_for_rows,
-        write_pinned_names,
+        App, NameAction, Prompt, SHORTCUTS, Session, VisibleRow, arrange_sessions,
+        build_visible_rows, bulk_pin_target_state, first_session_row_position,
+        format_relative_activity, help_popup_height, help_popup_lines, mode_line, move_popup_lines,
+        next_help_index, pinned_names_from_sessions, prune_selected_sessions,
+        selected_count_for_group, session_name_matches, toggle_selection_for_group,
+        toggle_selection_for_rows, write_pinned_names,
     };
     use crate::groups::{Group, GroupState};
     use std::collections::BTreeSet;
@@ -2259,6 +2261,20 @@ mod tests {
                 2,
             )
             .starts_with("MODE move: 2 sessions")
+        );
+        assert_eq!(
+            mode_line(
+                Some(&Prompt::Name {
+                    label: "NEW GROUP",
+                    value: "Work".to_string(),
+                    action: NameAction::Create,
+                }),
+                false,
+                "",
+                true,
+                0,
+            ),
+            "MODE input: NEW GROUP: Work_"
         );
     }
 }
