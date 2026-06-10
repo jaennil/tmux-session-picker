@@ -35,6 +35,9 @@ cargo build --release
 | `x` | Kill selected sessions after confirmation, or kill highlighted session |
 | `?` | Show shortcut help |
 | `q` | Quit |
+| Left click | Move the cursor to a group or session |
+| Double-click | Switch session or toggle group |
+| Checkbox click | Toggle a session while selection mode is active |
 
 Set `TMUX_SESSION_GROUP_FILE` to use another group state file. This is useful
 for testing without changing your normal configuration.

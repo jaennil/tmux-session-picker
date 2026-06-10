@@ -7,7 +7,7 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod groups;
 
@@ -27,6 +27,94 @@ struct Session {
 enum VisibleRow {
     Group(usize),
     Session(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MouseEvent {
+    button: u16,
+    col: usize,
+    row: usize,
+    pressed: bool,
+}
+
+enum InputEvent {
+    Key(u8),
+    Mouse(MouseEvent),
+}
+
+fn parse_sgr_mouse(input: &[u8]) -> Option<MouseEvent> {
+    if !input.starts_with(b"\x1b[<") {
+        return None;
+    }
+    let (&terminator, body) = input[3..].split_last()?;
+    if terminator != b'M' && terminator != b'm' {
+        return None;
+    }
+
+    let body = std::str::from_utf8(body).ok()?;
+    let mut parts = body.split(';');
+    let button = parts.next()?.parse().ok()?;
+    let col = parts.next()?.parse().ok()?;
+    let row = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || col == 0 || row == 0 {
+        return None;
+    }
+
+    Some(MouseEvent {
+        button,
+        col,
+        row,
+        pressed: terminator == b'M',
+    })
+}
+
+fn visible_index_for_mouse_row(
+    mouse_row: usize,
+    list_row_start: usize,
+    list_height: usize,
+    top: usize,
+    row_count: usize,
+) -> Option<usize> {
+    let offset = mouse_row.checked_sub(list_row_start)?;
+    if offset >= list_height {
+        return None;
+    }
+    let index = top.checked_add(offset)?;
+    (index < row_count).then_some(index)
+}
+
+fn input_is_ready(fd: RawFd, timeout_ms: i32) -> io::Result<bool> {
+    let mut poll_fd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(result > 0 && poll_fd.revents & libc::POLLIN != 0)
+}
+
+fn read_input_event(reader: &mut impl Read, fd: RawFd) -> io::Result<InputEvent> {
+    let mut byte = [0_u8; 1];
+    reader.read_exact(&mut byte)?;
+    if byte[0] != 0x1b {
+        return Ok(InputEvent::Key(byte[0]));
+    }
+
+    let mut sequence = vec![byte[0]];
+    while sequence.len() < 32 && input_is_ready(fd, 10)? {
+        reader.read_exact(&mut byte)?;
+        sequence.push(byte[0]);
+        if byte[0] == b'M' || byte[0] == b'm' {
+            break;
+        }
+    }
+
+    Ok(parse_sgr_mouse(&sequence)
+        .map(InputEvent::Mouse)
+        .unwrap_or(InputEvent::Key(0x1b)))
 }
 
 fn build_visible_rows(
@@ -193,6 +281,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("J/K", "reorder group or pinned session"),
     ("x", "kill selected sessions"),
     ("?", "show shortcuts"),
+    ("Mouse", "click select; double-click activate"),
     ("q", "quit"),
 ];
 
@@ -331,6 +420,7 @@ struct App {
     searching: bool,
     ungrouped_collapsed: bool,
     prompt: Option<Prompt>,
+    last_click: Option<(VisibleRow, Instant)>,
 }
 
 #[derive(Clone)]
@@ -408,6 +498,7 @@ impl App {
             searching: false,
             ungrouped_collapsed: false,
             prompt: None,
+            last_click: None,
         })
     }
 
@@ -416,20 +507,31 @@ impl App {
         self.render_full()?;
 
         let mut stdin = io::stdin();
-        let mut byte = [0_u8; 1];
+        let stdin_fd = stdin.as_raw_fd();
 
         loop {
-            stdin.read_exact(&mut byte)?;
+            let input = read_input_event(&mut stdin, stdin_fd)?;
+            if let InputEvent::Mouse(mouse) = input {
+                if self.handle_mouse(mouse)? {
+                    break;
+                }
+                self.ensure_visible();
+                self.render_full()?;
+                continue;
+            }
+            let InputEvent::Key(key) = input else {
+                unreachable!();
+            };
 
             if self.prompt.is_some() {
-                self.handle_prompt(byte[0])?;
+                self.handle_prompt(key)?;
                 self.ensure_visible();
                 self.render_full()?;
                 continue;
             }
 
             if self.searching {
-                match byte[0] {
+                match key {
                     b'\r' | b'\n' if self.activate_selected()? => break,
                     b'\r' | b'\n' => {}
                     0x1b => {
@@ -458,7 +560,7 @@ impl App {
                 continue;
             }
 
-            match byte[0] {
+            match key {
                 b'j' => self.move_down(),
                 b'k' => self.move_up(),
                 b'g' => self.jump_first(),
@@ -493,6 +595,52 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn handle_mouse(&mut self, event: MouseEvent) -> AppResult<bool> {
+        let left_button = event.button & 0b11 == 0 && event.button & 0b100_0000 == 0;
+        if !event.pressed || !left_button || self.prompt.is_some() {
+            return Ok(false);
+        }
+
+        let layout = self.layout();
+        let rows = self.visible_rows();
+        let Some(index) = visible_index_for_mouse_row(
+            event.row,
+            layout.list_row_start,
+            self.visible_list_height(),
+            self.top,
+            rows.len(),
+        ) else {
+            self.last_click = None;
+            return Ok(false);
+        };
+        let row = rows[index];
+        self.selected = index;
+
+        let checkbox_start = layout.table_col + 2;
+        let checkbox_end = checkbox_start + 2;
+        if !self.selected_sessions.is_empty()
+            && matches!(row, VisibleRow::Session(_))
+            && (checkbox_start..=checkbox_end).contains(&event.col)
+        {
+            self.toggle_selected_row_selection();
+            self.last_click = None;
+            return Ok(false);
+        }
+
+        let now = Instant::now();
+        let repeated = self.last_click.is_some_and(|(previous_row, previous_at)| {
+            previous_row == row
+                && now.saturating_duration_since(previous_at) <= Duration::from_millis(400)
+        });
+        self.last_click = Some((row, now));
+
+        if repeated && self.selected_sessions.is_empty() {
+            self.last_click = None;
+            return self.activate_selected();
+        }
+        Ok(false)
     }
 
     fn visible_rows(&self) -> Vec<VisibleRow> {
@@ -1566,7 +1714,7 @@ impl TerminalGuard {
         set_termios(fd, &raw_state)?;
 
         let mut stdout = io::stdout().lock();
-        write!(stdout, "\x1b[?1049h\x1b[?25l")?;
+        write!(stdout, "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h")?;
         stdout.flush()?;
 
         Ok(Self { fd, saved_state })
@@ -1577,7 +1725,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = set_termios(self.fd, &self.saved_state);
         let mut stdout = io::stdout().lock();
-        let _ = write!(stdout, "\x1b[?25h\x1b[?1049l");
+        let _ = write!(stdout, "\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l");
         let _ = stdout.flush();
     }
 }
@@ -1875,12 +2023,13 @@ fn main() -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, NameAction, Prompt, SHORTCUTS, Session, VisibleRow, arrange_sessions,
+        App, MouseEvent, NameAction, Prompt, SHORTCUTS, Session, VisibleRow, arrange_sessions,
         build_visible_rows, bulk_pin_target_state, first_session_row_position,
         format_relative_activity, help_popup_height, help_popup_lines, mode_line, move_popup_lines,
-        next_help_index, pinned_names_from_sessions, prune_selected_sessions,
+        next_help_index, parse_sgr_mouse, pinned_names_from_sessions, prune_selected_sessions,
         selected_count_for_group, session_name_matches, session_row_line,
-        toggle_selection_for_group, toggle_selection_for_rows, write_pinned_names,
+        toggle_selection_for_group, toggle_selection_for_rows, visible_index_for_mouse_row,
+        write_pinned_names,
     };
     use crate::groups::{Group, GroupState};
     use std::collections::BTreeSet;
@@ -1923,6 +2072,7 @@ mod tests {
             searching: false,
             ungrouped_collapsed: false,
             prompt: None,
+            last_click: None,
         }
     }
 
@@ -2348,5 +2498,110 @@ mod tests {
         let db = session("db", 0, false);
         let unselected_line = session_row_line(" ", &db, &selected, 16, 4);
         assert!(unselected_line.contains("[ ]"));
+    }
+
+    #[test]
+    fn sgr_mouse_parser_decodes_press_and_release() {
+        let press = parse_sgr_mouse(b"\x1b[<0;12;7M").unwrap();
+        assert_eq!(press.button, 0);
+        assert_eq!(press.col, 12);
+        assert_eq!(press.row, 7);
+        assert!(press.pressed);
+
+        let release = parse_sgr_mouse(b"\x1b[<0;12;7m").unwrap();
+        assert!(!release.pressed);
+    }
+
+    #[test]
+    fn sgr_mouse_parser_rejects_malformed_input() {
+        assert!(parse_sgr_mouse(b"\x1b[M !!").is_none());
+        assert!(parse_sgr_mouse(b"\x1b[<0;12M").is_none());
+        assert!(parse_sgr_mouse(b"\x1b[<x;12;7M").is_none());
+    }
+
+    #[test]
+    fn mouse_row_maps_into_scrolled_visible_list() {
+        assert_eq!(visible_index_for_mouse_row(8, 8, 4, 3, 9), Some(3));
+        assert_eq!(visible_index_for_mouse_row(11, 8, 4, 3, 9), Some(6));
+    }
+
+    #[test]
+    fn mouse_row_outside_rendered_sessions_is_ignored() {
+        assert_eq!(visible_index_for_mouse_row(7, 8, 4, 0, 9), None);
+        assert_eq!(visible_index_for_mouse_row(12, 8, 4, 0, 9), None);
+        assert_eq!(visible_index_for_mouse_row(10, 8, 4, 0, 2), None);
+    }
+
+    #[test]
+    fn left_click_moves_cursor_to_visible_session() {
+        let mut app = app_with_sessions(vec![
+            session("api", 0, false),
+            session("database", 0, false),
+        ]);
+        let layout = app.layout();
+
+        let activated = app
+            .handle_mouse(MouseEvent {
+                button: 0,
+                col: 10,
+                row: layout.list_row_start + 2,
+                pressed: true,
+            })
+            .unwrap();
+
+        assert!(!activated);
+        assert_eq!(app.selected_row(), Some(VisibleRow::Session(1)));
+    }
+
+    #[test]
+    fn checkbox_click_toggles_session_in_selection_mode() {
+        let mut app = app_with_sessions(vec![session("api", 0, false)]);
+        app.selected_sessions.insert("api".to_string());
+        let layout = app.layout();
+
+        app.handle_mouse(MouseEvent {
+            button: 0,
+            col: layout.table_col + 2,
+            row: layout.list_row_start + 1,
+            pressed: true,
+        })
+        .unwrap();
+
+        assert!(app.selected_sessions.is_empty());
+    }
+
+    #[test]
+    fn double_click_toggles_group() {
+        let mut app = app_with_sessions(vec![session("api", 0, false)]);
+        let layout = app.layout();
+        let click = MouseEvent {
+            button: 0,
+            col: 4,
+            row: layout.list_row_start,
+            pressed: true,
+        };
+
+        app.handle_mouse(click).unwrap();
+        app.handle_mouse(click).unwrap();
+
+        assert!(app.ungrouped_collapsed);
+    }
+
+    #[test]
+    fn popup_ignores_mouse_clicks() {
+        let mut app = app_with_sessions(vec![session("api", 0, false)]);
+        app.show_help();
+        let layout = app.layout();
+
+        app.handle_mouse(MouseEvent {
+            button: 0,
+            col: 10,
+            row: layout.list_row_start + 1,
+            pressed: true,
+        })
+        .unwrap();
+
+        assert_eq!(app.selected_row(), Some(VisibleRow::Group(0)));
+        assert!(matches!(app.prompt, Some(Prompt::Help { .. })));
     }
 }
