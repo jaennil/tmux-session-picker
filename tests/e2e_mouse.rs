@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[test]
-fn mouse_click_switches_session_in_terminal() {
+fn mouse_double_click_switches_session_in_terminal() {
     let temp_dir = temp_dir("mouse");
     fs::create_dir_all(&temp_dir).unwrap();
     let tmux_bin = temp_dir.join("tmux");
@@ -22,7 +22,7 @@ fn mouse_click_switches_session_in_terminal() {
     let mut child = spawn_picker(&temp_dir, &switch_file, &pin_file, slave);
 
     wait_for_output(&mut master, "clicked", Duration::from_secs(2));
-    master.write_all(b"\x1b[<0;5;21M").unwrap();
+    master.write_all(b"\x1b[<0;5;21M\x1b[<0;5;21M").unwrap();
     master.flush().unwrap();
 
     let switched = wait_for_file(

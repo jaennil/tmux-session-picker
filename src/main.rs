@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::env;
 use std::error::Error;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
@@ -40,13 +40,14 @@ struct MouseEvent {
 enum InputEvent {
     Key(u8),
     Mouse(MouseEvent),
+    Ignore,
 }
 
-fn parse_sgr_mouse(input: &[u8]) -> Option<MouseEvent> {
-    if !input.starts_with(b"\x1b[<") {
+fn parse_sgr_mouse_body(input: &[u8]) -> Option<MouseEvent> {
+    if !input.starts_with(b"[<") {
         return None;
     }
-    let (&terminator, body) = input[3..].split_last()?;
+    let (&terminator, body) = input[2..].split_last()?;
     if terminator != b'M' && terminator != b'm' {
         return None;
     }
@@ -66,6 +67,34 @@ fn parse_sgr_mouse(input: &[u8]) -> Option<MouseEvent> {
         row,
         pressed: terminator == b'M',
     })
+}
+
+fn parse_x10_mouse_body(input: &[u8]) -> Option<MouseEvent> {
+    if input.len() != 5 || !input.starts_with(b"[M") {
+        return None;
+    }
+
+    let button = u16::from(input[2]).checked_sub(32)?;
+    let col = usize::from(input[3]).checked_sub(32)?;
+    let row = usize::from(input[4]).checked_sub(32)?;
+    if col == 0 || row == 0 {
+        return None;
+    }
+
+    Some(MouseEvent {
+        button,
+        col,
+        row,
+        pressed: button & 0b11 != 0b11,
+    })
+}
+
+fn parse_mouse_escape(input: &[u8]) -> Option<MouseEvent> {
+    if !input.starts_with(b"\x1b") {
+        return None;
+    }
+    let body = &input[1..];
+    parse_sgr_mouse_body(body).or_else(|| parse_x10_mouse_body(body))
 }
 
 fn visible_index_for_mouse_row(
@@ -96,23 +125,47 @@ fn input_is_ready(fd: RawFd, timeout_ms: i32) -> io::Result<bool> {
     Ok(result > 0 && poll_fd.revents & libc::POLLIN != 0)
 }
 
-fn read_input_event(reader: &mut impl Read, fd: RawFd) -> io::Result<InputEvent> {
-    let mut byte = [0_u8; 1];
-    reader.read_exact(&mut byte)?;
-    if byte[0] != 0x1b {
-        return Ok(InputEvent::Key(byte[0]));
+fn read_fd_byte(fd: RawFd) -> io::Result<u8> {
+    let mut byte = 0_u8;
+    loop {
+        let result = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+        if result == 1 {
+            return Ok(byte);
+        }
+        if result == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+fn read_input_event(fd: RawFd) -> io::Result<InputEvent> {
+    let byte = read_fd_byte(fd)?;
+    if byte != 0x1b {
+        return Ok(InputEvent::Key(byte));
     }
 
-    let mut sequence = vec![byte[0]];
-    while sequence.len() < 32 && input_is_ready(fd, 10)? {
-        reader.read_exact(&mut byte)?;
-        sequence.push(byte[0]);
-        if byte[0] == b'M' || byte[0] == b'm' {
+    let mut sequence = vec![byte];
+    while sequence.len() < 32 && input_is_ready(fd, 80)? {
+        let byte = read_fd_byte(fd)?;
+        sequence.push(byte);
+        if sequence.starts_with(b"\x1b[M") && sequence.len() == 6 {
+            break;
+        }
+        if sequence.starts_with(b"\x1b[<") && (byte == b'M' || byte == b'm') {
             break;
         }
     }
 
-    Ok(parse_sgr_mouse(&sequence)
+    if sequence.len() > 1 && parse_mouse_escape(&sequence).is_none() {
+        return Ok(InputEvent::Ignore);
+    }
+
+    Ok(parse_mouse_escape(&sequence)
         .map(InputEvent::Mouse)
         .unwrap_or(InputEvent::Key(0x1b)))
 }
@@ -506,17 +559,19 @@ impl App {
         self.ensure_visible();
         self.render_full()?;
 
-        let mut stdin = io::stdin();
-        let stdin_fd = stdin.as_raw_fd();
+        let stdin_fd = io::stdin().as_raw_fd();
 
         loop {
-            let input = read_input_event(&mut stdin, stdin_fd)?;
+            let input = read_input_event(stdin_fd)?;
             if let InputEvent::Mouse(mouse) = input {
                 if self.handle_mouse(mouse)? {
                     break;
                 }
                 self.ensure_visible();
                 self.render_full()?;
+                continue;
+            }
+            if let InputEvent::Ignore = input {
                 continue;
             }
             let InputEvent::Key(key) = input else {
@@ -2026,7 +2081,7 @@ mod tests {
         App, MouseEvent, NameAction, Prompt, SHORTCUTS, Session, VisibleRow, arrange_sessions,
         build_visible_rows, bulk_pin_target_state, first_session_row_position,
         format_relative_activity, help_popup_height, help_popup_lines, mode_line, move_popup_lines,
-        next_help_index, parse_sgr_mouse, pinned_names_from_sessions, prune_selected_sessions,
+        next_help_index, parse_mouse_escape, pinned_names_from_sessions, prune_selected_sessions,
         selected_count_for_group, session_name_matches, session_row_line,
         toggle_selection_for_group, toggle_selection_for_rows, visible_index_for_mouse_row,
         write_pinned_names,
@@ -2502,21 +2557,31 @@ mod tests {
 
     #[test]
     fn sgr_mouse_parser_decodes_press_and_release() {
-        let press = parse_sgr_mouse(b"\x1b[<0;12;7M").unwrap();
+        let press = parse_mouse_escape(b"\x1b[<0;12;7M").unwrap();
         assert_eq!(press.button, 0);
         assert_eq!(press.col, 12);
         assert_eq!(press.row, 7);
         assert!(press.pressed);
 
-        let release = parse_sgr_mouse(b"\x1b[<0;12;7m").unwrap();
+        let release = parse_mouse_escape(b"\x1b[<0;12;7m").unwrap();
         assert!(!release.pressed);
     }
 
     #[test]
     fn sgr_mouse_parser_rejects_malformed_input() {
-        assert!(parse_sgr_mouse(b"\x1b[M !!").is_none());
-        assert!(parse_sgr_mouse(b"\x1b[<0;12M").is_none());
-        assert!(parse_sgr_mouse(b"\x1b[<x;12;7M").is_none());
+        assert!(parse_mouse_escape(b"\x1b[M !").is_none());
+        assert!(parse_mouse_escape(b"\x1b[<0;12M").is_none());
+        assert!(parse_mouse_escape(b"\x1b[<x;12;7M").is_none());
+    }
+
+    #[test]
+    fn legacy_mouse_parser_decodes_press() {
+        let event = parse_mouse_escape(b"\x1b[M *'").unwrap();
+
+        assert_eq!(event.button, 0);
+        assert_eq!(event.col, 10);
+        assert_eq!(event.row, 7);
+        assert!(event.pressed);
     }
 
     #[test]
