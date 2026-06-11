@@ -29,14 +29,15 @@ struct MouseEvent {
 enum InputEvent {
     Key(u8),
     Mouse(MouseEvent),
+    Ignore,
 }
 
-fn parse_sgr_mouse(input: &[u8]) -> Option<MouseEvent> {
-    if !input.starts_with(b"\x1b[<") {
+fn parse_sgr_mouse_body(input: &[u8]) -> Option<MouseEvent> {
+    if !input.starts_with(b"[<") {
         return None;
     }
 
-    let (&terminator, body) = input[3..].split_last()?;
+    let (&terminator, body) = input[2..].split_last()?;
     if terminator != b'M' && terminator != b'm' {
         return None;
     }
@@ -56,6 +57,34 @@ fn parse_sgr_mouse(input: &[u8]) -> Option<MouseEvent> {
         row,
         pressed: terminator == b'M',
     })
+}
+
+fn parse_x10_mouse_body(input: &[u8]) -> Option<MouseEvent> {
+    if input.len() != 5 || !input.starts_with(b"[M") {
+        return None;
+    }
+
+    let button = u16::from(input[2]).checked_sub(32)?;
+    let col = usize::from(input[3]).checked_sub(32)?;
+    let row = usize::from(input[4]).checked_sub(32)?;
+    if col == 0 || row == 0 {
+        return None;
+    }
+
+    Some(MouseEvent {
+        button,
+        col,
+        row,
+        pressed: button & 0b11 != 0b11,
+    })
+}
+
+fn parse_mouse_escape(input: &[u8]) -> Option<MouseEvent> {
+    if !input.starts_with(b"\x1b") {
+        return None;
+    }
+    let body = &input[1..];
+    parse_sgr_mouse_body(body).or_else(|| parse_x10_mouse_body(body))
 }
 
 fn session_index_for_mouse_row(
@@ -93,15 +122,22 @@ fn read_input_event(reader: &mut impl Read, fd: RawFd) -> io::Result<InputEvent>
     }
 
     let mut sequence = vec![byte[0]];
-    while sequence.len() < 32 && input_is_ready(fd, 10)? {
+    while sequence.len() < 32 && input_is_ready(fd, 80)? {
         reader.read_exact(&mut byte)?;
         sequence.push(byte[0]);
-        if byte[0] == b'M' || byte[0] == b'm' {
+        if sequence.starts_with(b"\x1b[M") && sequence.len() == 6 {
+            break;
+        }
+        if sequence.starts_with(b"\x1b[<") && (byte[0] == b'M' || byte[0] == b'm') {
             break;
         }
     }
 
-    Ok(parse_sgr_mouse(&sequence)
+    if sequence.len() > 1 && parse_mouse_escape(&sequence).is_none() {
+        return Ok(InputEvent::Ignore);
+    }
+
+    Ok(parse_mouse_escape(&sequence)
         .map(InputEvent::Mouse)
         .unwrap_or(InputEvent::Key(0x1b)))
 }
@@ -172,9 +208,15 @@ impl App {
 
             let input = read_input_event(&mut stdin, stdin_fd)?;
             if let InputEvent::Mouse(mouse) = input {
-                self.handle_mouse(mouse);
+                if self.handle_mouse(mouse) {
+                    self.switch_selected()?;
+                    break;
+                }
                 self.ensure_visible();
                 self.render_incremental(previous_selected, previous_top, &previous_status)?;
+                continue;
+            }
+            if let InputEvent::Ignore = input {
                 continue;
             }
             let InputEvent::Key(key) = input else {
@@ -248,10 +290,10 @@ impl App {
         Ok(())
     }
 
-    fn handle_mouse(&mut self, event: MouseEvent) {
+    fn handle_mouse(&mut self, event: MouseEvent) -> bool {
         let left_button = event.button & 0b11 == 0 && event.button & 0b100_0000 == 0;
         if !event.pressed || !left_button {
-            return;
+            return false;
         }
 
         let layout = self.layout();
@@ -264,7 +306,9 @@ impl App {
             &matches,
         ) {
             self.selected = session_index;
+            return true;
         }
+        false
     }
 
     fn move_up(&mut self) {
@@ -1000,7 +1044,7 @@ fn main() -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, MouseEvent, Session, arrange_sessions, format_relative_activity, parse_sgr_mouse,
+        App, MouseEvent, Session, arrange_sessions, format_relative_activity, parse_mouse_escape,
         pinned_names_from_sessions, session_index_for_mouse_row, session_name_matches,
         write_pinned_names,
     };
@@ -1108,7 +1152,7 @@ mod tests {
 
     #[test]
     fn sgr_mouse_parser_decodes_left_click() {
-        let event = parse_sgr_mouse(b"\x1b[<0;12;7M").unwrap();
+        let event = parse_mouse_escape(b"\x1b[<0;12;7M").unwrap();
 
         assert_eq!(event.button, 0);
         assert_eq!(event.col, 12);
@@ -1117,9 +1161,19 @@ mod tests {
     }
 
     #[test]
+    fn legacy_mouse_parser_decodes_left_click() {
+        let event = parse_mouse_escape(b"\x1b[M *'").unwrap();
+
+        assert_eq!(event.button, 0);
+        assert_eq!(event.col, 10);
+        assert_eq!(event.row, 7);
+        assert!(event.pressed);
+    }
+
+    #[test]
     fn sgr_mouse_parser_rejects_incomplete_sequence() {
-        assert!(parse_sgr_mouse(b"\x1b").is_none());
-        assert!(parse_sgr_mouse(b"\x1b[<0;12M").is_none());
+        assert!(parse_mouse_escape(b"\x1b").is_none());
+        assert!(parse_mouse_escape(b"\x1b[<0;12M").is_none());
     }
 
     #[test]
@@ -1140,20 +1194,21 @@ mod tests {
     }
 
     #[test]
-    fn mouse_click_selects_session_under_cursor() {
+    fn mouse_click_selects_and_activates_session_under_cursor() {
         let mut app = app_with_sessions(vec![
             session("api", 0, false),
             session("database", 0, false),
         ]);
         let layout = app.layout();
 
-        app.handle_mouse(MouseEvent {
+        let activated = app.handle_mouse(MouseEvent {
             button: 0,
             col: 8,
             row: layout.list_row_start + 1,
             pressed: true,
         });
 
+        assert!(activated);
         assert_eq!(app.selected, 1);
     }
 }

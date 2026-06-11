@@ -22,4 +22,4 @@ cargo build --release
 | `J` / `K` | Reorder pinned session |
 | `x` | Kill selected session |
 | `q` | Quit |
-| Left click | Select the session under the cursor |
+| Left click | Switch to the session under the cursor |
