@@ -1,7 +1,7 @@
 use std::env;
 use std::error::Error;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
@@ -114,21 +114,38 @@ fn input_is_ready(fd: RawFd, timeout_ms: i32) -> io::Result<bool> {
     Ok(result > 0 && poll_fd.revents & libc::POLLIN != 0)
 }
 
-fn read_input_event(reader: &mut impl Read, fd: RawFd) -> io::Result<InputEvent> {
-    let mut byte = [0_u8; 1];
-    reader.read_exact(&mut byte)?;
-    if byte[0] != 0x1b {
-        return Ok(InputEvent::Key(byte[0]));
+fn read_fd_byte(fd: RawFd) -> io::Result<u8> {
+    let mut byte = 0_u8;
+    loop {
+        let result = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+        if result == 1 {
+            return Ok(byte);
+        }
+        if result == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+fn read_input_event(fd: RawFd) -> io::Result<InputEvent> {
+    let byte = read_fd_byte(fd)?;
+    if byte != 0x1b {
+        return Ok(InputEvent::Key(byte));
     }
 
-    let mut sequence = vec![byte[0]];
+    let mut sequence = vec![byte];
     while sequence.len() < 32 && input_is_ready(fd, 80)? {
-        reader.read_exact(&mut byte)?;
-        sequence.push(byte[0]);
+        let byte = read_fd_byte(fd)?;
+        sequence.push(byte);
         if sequence.starts_with(b"\x1b[M") && sequence.len() == 6 {
             break;
         }
-        if sequence.starts_with(b"\x1b[<") && (byte[0] == b'M' || byte[0] == b'm') {
+        if sequence.starts_with(b"\x1b[<") && (byte == b'M' || byte == b'm') {
             break;
         }
     }
@@ -197,8 +214,7 @@ impl App {
         self.ensure_visible();
         self.render_full()?;
 
-        let mut stdin = io::stdin();
-        let stdin_fd = stdin.as_raw_fd();
+        let stdin_fd = io::stdin().as_raw_fd();
 
         loop {
             let previous_selected = self.selected;
@@ -206,7 +222,7 @@ impl App {
             let previous_status = self.status.clone();
             let mut redraw_full = false;
 
-            let input = read_input_event(&mut stdin, stdin_fd)?;
+            let input = read_input_event(stdin_fd)?;
             if let InputEvent::Mouse(mouse) = input {
                 if self.handle_mouse(mouse) {
                     self.switch_selected()?;
