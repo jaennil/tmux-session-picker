@@ -18,6 +18,94 @@ struct Session {
     is_current: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MouseEvent {
+    button: u16,
+    col: usize,
+    row: usize,
+    pressed: bool,
+}
+
+enum InputEvent {
+    Key(u8),
+    Mouse(MouseEvent),
+}
+
+fn parse_sgr_mouse(input: &[u8]) -> Option<MouseEvent> {
+    if !input.starts_with(b"\x1b[<") {
+        return None;
+    }
+
+    let (&terminator, body) = input[3..].split_last()?;
+    if terminator != b'M' && terminator != b'm' {
+        return None;
+    }
+
+    let body = std::str::from_utf8(body).ok()?;
+    let mut parts = body.split(';');
+    let button = parts.next()?.parse().ok()?;
+    let col = parts.next()?.parse().ok()?;
+    let row = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || col == 0 || row == 0 {
+        return None;
+    }
+
+    Some(MouseEvent {
+        button,
+        col,
+        row,
+        pressed: terminator == b'M',
+    })
+}
+
+fn session_index_for_mouse_row(
+    mouse_row: usize,
+    list_row_start: usize,
+    list_height: usize,
+    top: usize,
+    matches: &[usize],
+) -> Option<usize> {
+    let offset = mouse_row.checked_sub(list_row_start)?;
+    if offset >= list_height {
+        return None;
+    }
+    matches.get(top.checked_add(offset)?).copied()
+}
+
+fn input_is_ready(fd: RawFd, timeout_ms: i32) -> io::Result<bool> {
+    let mut poll_fd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(result > 0 && poll_fd.revents & libc::POLLIN != 0)
+}
+
+fn read_input_event(reader: &mut impl Read, fd: RawFd) -> io::Result<InputEvent> {
+    let mut byte = [0_u8; 1];
+    reader.read_exact(&mut byte)?;
+    if byte[0] != 0x1b {
+        return Ok(InputEvent::Key(byte[0]));
+    }
+
+    let mut sequence = vec![byte[0]];
+    while sequence.len() < 32 && input_is_ready(fd, 10)? {
+        reader.read_exact(&mut byte)?;
+        sequence.push(byte[0]);
+        if byte[0] == b'M' || byte[0] == b'm' {
+            break;
+        }
+    }
+
+    Ok(parse_sgr_mouse(&sequence)
+        .map(InputEvent::Mouse)
+        .unwrap_or(InputEvent::Key(0x1b)))
+}
+
 struct App {
     sessions: Vec<Session>,
     selected: usize,
@@ -74,7 +162,7 @@ impl App {
         self.render_full()?;
 
         let mut stdin = io::stdin();
-        let mut byte = [0_u8; 1];
+        let stdin_fd = stdin.as_raw_fd();
 
         loop {
             let previous_selected = self.selected;
@@ -82,10 +170,19 @@ impl App {
             let previous_status = self.status.clone();
             let mut redraw_full = false;
 
-            stdin.read_exact(&mut byte)?;
+            let input = read_input_event(&mut stdin, stdin_fd)?;
+            if let InputEvent::Mouse(mouse) = input {
+                self.handle_mouse(mouse);
+                self.ensure_visible();
+                self.render_incremental(previous_selected, previous_top, &previous_status)?;
+                continue;
+            }
+            let InputEvent::Key(key) = input else {
+                unreachable!();
+            };
 
             if self.searching {
-                match byte[0] {
+                match key {
                     b'\r' | b'\n' => {
                         if self.has_matches() {
                             self.switch_selected()?;
@@ -113,7 +210,7 @@ impl App {
                 continue;
             }
 
-            match byte[0] {
+            match key {
                 b'j' => self.move_down(),
                 b'k' => self.move_up(),
                 b'g' => self.jump_first(),
@@ -151,21 +248,40 @@ impl App {
         Ok(())
     }
 
+    fn handle_mouse(&mut self, event: MouseEvent) {
+        let left_button = event.button & 0b11 == 0 && event.button & 0b100_0000 == 0;
+        if !event.pressed || !left_button {
+            return;
+        }
+
+        let layout = self.layout();
+        let matches = self.matching_indices();
+        if let Some(session_index) = session_index_for_mouse_row(
+            event.row,
+            layout.list_row_start,
+            self.visible_list_height(),
+            self.top,
+            &matches,
+        ) {
+            self.selected = session_index;
+        }
+    }
+
     fn move_up(&mut self) {
         let matches = self.matching_indices();
-        if let Some(position) = matches.iter().position(|index| *index == self.selected) {
-            if position > 0 {
-                self.selected = matches[position - 1];
-            }
+        if let Some(position) = matches.iter().position(|index| *index == self.selected)
+            && position > 0
+        {
+            self.selected = matches[position - 1];
         }
     }
 
     fn move_down(&mut self) {
         let matches = self.matching_indices();
-        if let Some(position) = matches.iter().position(|index| *index == self.selected) {
-            if position + 1 < matches.len() {
-                self.selected = matches[position + 1];
-            }
+        if let Some(position) = matches.iter().position(|index| *index == self.selected)
+            && position + 1 < matches.len()
+        {
+            self.selected = matches[position + 1];
         }
     }
 
@@ -199,10 +315,10 @@ impl App {
 
     fn select_first_match(&mut self) {
         let matches = self.matching_indices();
-        if !matches.contains(&self.selected) {
-            if let Some(index) = matches.first() {
-                self.selected = *index;
-            }
+        if !matches.contains(&self.selected)
+            && let Some(index) = matches.first()
+        {
+            self.selected = *index;
         }
         self.top = 0;
     }
@@ -584,7 +700,7 @@ impl TerminalGuard {
         set_termios(fd, &raw_state)?;
 
         let mut stdout = io::stdout().lock();
-        write!(stdout, "\x1b[?1049h\x1b[?25l")?;
+        write!(stdout, "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h")?;
         stdout.flush()?;
 
         Ok(Self { fd, saved_state })
@@ -595,7 +711,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = set_termios(self.fd, &self.saved_state);
         let mut stdout = io::stdout().lock();
-        let _ = write!(stdout, "\x1b[?25h\x1b[?1049l");
+        let _ = write!(stdout, "\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l");
         let _ = stdout.flush();
     }
 }
@@ -884,8 +1000,9 @@ fn main() -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Session, arrange_sessions, format_relative_activity, pinned_names_from_sessions,
-        session_name_matches, write_pinned_names,
+        App, MouseEvent, Session, arrange_sessions, format_relative_activity, parse_sgr_mouse,
+        pinned_names_from_sessions, session_index_for_mouse_row, session_name_matches,
+        write_pinned_names,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -906,6 +1023,22 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("tmux-session-picker-test-{nanos}.{suffix}"))
+    }
+
+    fn app_with_sessions(sessions: Vec<Session>) -> App {
+        App {
+            sessions,
+            selected: 0,
+            top: 0,
+            rows: 24,
+            cols: 80,
+            pin_file: PathBuf::new(),
+            tmux_socket_name: None,
+            tmux_socket_path: None,
+            status: String::new(),
+            query: String::new(),
+            searching: false,
+        }
     }
 
     #[test]
@@ -971,5 +1104,56 @@ mod tests {
         assert!(session_name_matches("Guide-Helper", "helper"));
         assert!(session_name_matches("Guide-Helper", "GUIDE"));
         assert!(!session_name_matches("Guide-Helper", "dashboard"));
+    }
+
+    #[test]
+    fn sgr_mouse_parser_decodes_left_click() {
+        let event = parse_sgr_mouse(b"\x1b[<0;12;7M").unwrap();
+
+        assert_eq!(event.button, 0);
+        assert_eq!(event.col, 12);
+        assert_eq!(event.row, 7);
+        assert!(event.pressed);
+    }
+
+    #[test]
+    fn sgr_mouse_parser_rejects_incomplete_sequence() {
+        assert!(parse_sgr_mouse(b"\x1b").is_none());
+        assert!(parse_sgr_mouse(b"\x1b[<0;12M").is_none());
+    }
+
+    #[test]
+    fn mouse_row_selects_visible_scrolled_session() {
+        let matches = vec![2, 4, 7, 9, 11];
+
+        assert_eq!(session_index_for_mouse_row(8, 8, 3, 1, &matches), Some(4));
+        assert_eq!(session_index_for_mouse_row(10, 8, 3, 1, &matches), Some(9));
+    }
+
+    #[test]
+    fn mouse_row_outside_visible_sessions_is_ignored() {
+        let matches = vec![2, 4];
+
+        assert_eq!(session_index_for_mouse_row(7, 8, 3, 0, &matches), None);
+        assert_eq!(session_index_for_mouse_row(11, 8, 3, 0, &matches), None);
+        assert_eq!(session_index_for_mouse_row(10, 8, 3, 0, &matches), None);
+    }
+
+    #[test]
+    fn mouse_click_selects_session_under_cursor() {
+        let mut app = app_with_sessions(vec![
+            session("api", 0, false),
+            session("database", 0, false),
+        ]);
+        let layout = app.layout();
+
+        app.handle_mouse(MouseEvent {
+            button: 0,
+            col: 8,
+            row: layout.list_row_start + 1,
+            pressed: true,
+        });
+
+        assert_eq!(app.selected, 1);
     }
 }
