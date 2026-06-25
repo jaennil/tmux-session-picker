@@ -14,6 +14,7 @@ mod groups;
 use groups::GroupState;
 
 type AppResult<T> = Result<T, Box<dyn Error>>;
+const MOUSE_WHEEL_ROWS: isize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Session {
@@ -95,6 +96,18 @@ fn parse_mouse_escape(input: &[u8]) -> Option<MouseEvent> {
     }
     let body = &input[1..];
     parse_sgr_mouse_body(body).or_else(|| parse_x10_mouse_body(body))
+}
+
+fn mouse_wheel_delta(button: u16) -> Option<isize> {
+    if button & 0b100_0000 == 0 {
+        return None;
+    }
+
+    match button & 0b11 {
+        0 => Some(-MOUSE_WHEEL_ROWS),
+        1 => Some(MOUSE_WHEEL_ROWS),
+        _ => None,
+    }
 }
 
 fn visible_index_for_mouse_row(
@@ -335,6 +348,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("x", "kill selected sessions"),
     ("?", "show shortcuts"),
     ("Mouse", "click select; double-click activate"),
+    ("Wheel", "scroll sessions"),
     ("q", "quit"),
 ];
 
@@ -653,6 +667,14 @@ impl App {
     }
 
     fn handle_mouse(&mut self, event: MouseEvent) -> AppResult<bool> {
+        if let Some(delta) = mouse_wheel_delta(event.button) {
+            if event.pressed && self.prompt.is_none() {
+                self.scroll_visible_rows(delta);
+            }
+            self.last_click = None;
+            return Ok(false);
+        }
+
         let left_button = event.button & 0b11 == 0 && event.button & 0b100_0000 == 0;
         if !event.pressed || !left_button || self.prompt.is_some() {
             return Ok(false);
@@ -696,6 +718,33 @@ impl App {
             return self.activate_selected();
         }
         Ok(false)
+    }
+
+    fn scroll_visible_rows(&mut self, delta: isize) {
+        let row_count = self.visible_rows().len();
+        if row_count == 0 {
+            self.selected = 0;
+            self.top = 0;
+            return;
+        }
+
+        let viewport = self.viewport_height().min(row_count);
+        let max_top = row_count.saturating_sub(viewport);
+        let new_top = if delta.is_negative() {
+            self.top.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.top.saturating_add(delta as usize)
+        };
+        self.top = new_top.min(max_top);
+        self.selected = self.selected.min(row_count - 1);
+
+        if self.selected < self.top {
+            self.selected = self.top;
+        }
+        let bottom = self.top + viewport - 1;
+        if self.selected > bottom {
+            self.selected = bottom;
+        }
     }
 
     fn visible_rows(&self) -> Vec<VisibleRow> {
@@ -2080,11 +2129,11 @@ mod tests {
     use super::{
         App, MouseEvent, NameAction, Prompt, SHORTCUTS, Session, VisibleRow, arrange_sessions,
         build_visible_rows, bulk_pin_target_state, first_session_row_position,
-        format_relative_activity, help_popup_height, help_popup_lines, mode_line, move_popup_lines,
-        next_help_index, parse_mouse_escape, pinned_names_from_sessions, prune_selected_sessions,
-        selected_count_for_group, session_name_matches, session_row_line,
-        toggle_selection_for_group, toggle_selection_for_rows, visible_index_for_mouse_row,
-        write_pinned_names,
+        format_relative_activity, help_popup_height, help_popup_lines, mode_line,
+        mouse_wheel_delta, move_popup_lines, next_help_index, parse_mouse_escape,
+        pinned_names_from_sessions, prune_selected_sessions, selected_count_for_group,
+        session_name_matches, session_row_line, toggle_selection_for_group,
+        toggle_selection_for_rows, visible_index_for_mouse_row, write_pinned_names,
     };
     use crate::groups::{Group, GroupState};
     use std::collections::BTreeSet;
@@ -2585,6 +2634,16 @@ mod tests {
     }
 
     #[test]
+    fn mouse_wheel_buttons_map_to_scroll_delta() {
+        let down = parse_mouse_escape(b"\x1b[<65;12;7M").unwrap();
+        let up = parse_mouse_escape(b"\x1b[<64;12;7M").unwrap();
+
+        assert_eq!(mouse_wheel_delta(down.button), Some(3));
+        assert_eq!(mouse_wheel_delta(up.button), Some(-3));
+        assert_eq!(mouse_wheel_delta(0), None);
+    }
+
+    #[test]
     fn mouse_row_maps_into_scrolled_visible_list() {
         assert_eq!(visible_index_for_mouse_row(8, 8, 4, 3, 9), Some(3));
         assert_eq!(visible_index_for_mouse_row(11, 8, 4, 3, 9), Some(6));
@@ -2595,6 +2654,28 @@ mod tests {
         assert_eq!(visible_index_for_mouse_row(7, 8, 4, 0, 9), None);
         assert_eq!(visible_index_for_mouse_row(12, 8, 4, 0, 9), None);
         assert_eq!(visible_index_for_mouse_row(10, 8, 4, 0, 2), None);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_visible_rows() {
+        let sessions = (1..=20)
+            .map(|index| session(&format!("s{index:02}"), 0, false))
+            .collect::<Vec<_>>();
+        let mut app = app_with_sessions(sessions);
+        app.rows = 10;
+
+        let activated = app
+            .handle_mouse(MouseEvent {
+                button: 65,
+                col: 5,
+                row: app.layout().list_row_start + 1,
+                pressed: true,
+            })
+            .unwrap();
+
+        assert!(!activated);
+        assert_eq!(app.top, 3);
+        assert_eq!(app.selected, 3);
     }
 
     #[test]

@@ -14,12 +14,21 @@ fn mouse_double_click_switches_session_in_terminal() {
     let temp_dir = temp_dir("mouse");
     fs::create_dir_all(&temp_dir).unwrap();
     let tmux_bin = temp_dir.join("tmux");
+    let sessions_file = temp_dir.join("sessions");
     let switch_file = temp_dir.join("switched");
     let pin_file = temp_dir.join("pins");
     write_fake_tmux(&tmux_bin);
+    write_sessions(&sessions_file, &[("current", 100), ("clicked", 200)]);
 
     let (mut master, slave) = open_pty(24, 80);
-    let mut child = spawn_picker(&temp_dir, &switch_file, &pin_file, slave);
+    let mut child = spawn_picker(
+        &temp_dir,
+        &sessions_file,
+        "current",
+        &switch_file,
+        &pin_file,
+        slave,
+    );
 
     wait_for_output(&mut master, "clicked", Duration::from_secs(2));
     master.write_all(b"\x1b[<0;5;21M\x1b[<0;5;21M").unwrap();
@@ -33,6 +42,49 @@ fn mouse_double_click_switches_session_in_terminal() {
     );
     assert_eq!(switched.trim(), "clicked");
 
+    let status = child.wait().unwrap();
+    assert!(status.success());
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn mouse_wheel_scrolls_session_list_in_terminal() {
+    let temp_dir = temp_dir("wheel");
+    fs::create_dir_all(&temp_dir).unwrap();
+    let tmux_bin = temp_dir.join("tmux");
+    let sessions_file = temp_dir.join("sessions");
+    let switch_file = temp_dir.join("switched");
+    let pin_file = temp_dir.join("pins");
+    let sessions = (1..=30)
+        .map(|index| (format!("s{index:02}"), 10_000 - index))
+        .collect::<Vec<_>>();
+    write_fake_tmux(&tmux_bin);
+    write_sessions(
+        &sessions_file,
+        &sessions
+            .iter()
+            .map(|(name, activity)| (name.as_str(), *activity))
+            .collect::<Vec<_>>(),
+    );
+
+    let (mut master, slave) = open_pty(24, 80);
+    let mut child = spawn_picker(
+        &temp_dir,
+        &sessions_file,
+        "s01",
+        &switch_file,
+        &pin_file,
+        slave,
+    );
+
+    wait_for_output(&mut master, "s19", Duration::from_secs(2));
+    master.write_all(b"\x1b[<65;5;10M").unwrap();
+    master.flush().unwrap();
+    wait_for_output(&mut master, "s22", Duration::from_secs(2));
+
+    master.write_all(b"q").unwrap();
+    master.flush().unwrap();
     let status = child.wait().unwrap();
     assert!(status.success());
 
@@ -53,10 +105,10 @@ fn write_fake_tmux(path: &Path) {
         r#"#!/bin/sh
 case "$1" in
   display-message)
-    printf 'current\n'
+    printf '%s\n' "$TMUX_E2E_CURRENT_SESSION"
     ;;
   list-sessions)
-    printf 'current\t100\nclicked\t200\n'
+    cat "$TMUX_E2E_SESSIONS_FILE"
     ;;
   switch-client)
     while [ "$#" -gt 0 ]; do
@@ -80,6 +132,15 @@ esac
     let mut permissions = fs::metadata(path).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions).unwrap();
+}
+
+fn write_sessions(path: &Path, sessions: &[(&str, u64)]) {
+    let contents = sessions
+        .iter()
+        .map(|(name, activity)| format!("{name}\t{activity}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(path, format!("{contents}\n")).unwrap();
 }
 
 fn open_pty(rows: u16, cols: u16) -> (File, File) {
@@ -111,7 +172,14 @@ fn open_pty(rows: u16, cols: u16) -> (File, File) {
     }
 }
 
-fn spawn_picker(temp_dir: &Path, switch_file: &Path, pin_file: &Path, slave: File) -> Child {
+fn spawn_picker(
+    temp_dir: &Path,
+    sessions_file: &Path,
+    current_session: &str,
+    switch_file: &Path,
+    pin_file: &Path,
+    slave: File,
+) -> Child {
     let stdin = Stdio::from(slave.try_clone().unwrap());
     let stdout = Stdio::from(slave.try_clone().unwrap());
     let stderr = Stdio::from(slave);
@@ -127,6 +195,8 @@ fn spawn_picker(temp_dir: &Path, switch_file: &Path, pin_file: &Path, slave: Fil
         .stderr(stderr)
         .env("PATH", path)
         .env("HOME", temp_dir)
+        .env("TMUX_E2E_CURRENT_SESSION", current_session)
+        .env("TMUX_E2E_SESSIONS_FILE", sessions_file)
         .env("TMUX_E2E_SWITCH_FILE", switch_file)
         .env("TMUX_SESSION_PIN_FILE", pin_file)
         .spawn()
