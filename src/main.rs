@@ -14,6 +14,9 @@ mod groups;
 use groups::GroupState;
 
 type AppResult<T> = Result<T, Box<dyn Error>>;
+const MOUSE_BUTTON_MASK: u16 = 0b11;
+const MOUSE_DRAG_FLAG: u16 = 0b10_0000;
+const MOUSE_WHEEL_FLAG: u16 = 0b100_0000;
 const MOUSE_WHEEL_ROWS: isize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,15 +102,24 @@ fn parse_mouse_escape(input: &[u8]) -> Option<MouseEvent> {
 }
 
 fn mouse_wheel_delta(button: u16) -> Option<isize> {
-    if button & 0b100_0000 == 0 {
+    if button & MOUSE_WHEEL_FLAG == 0 {
         return None;
     }
 
-    match button & 0b11 {
+    match button & MOUSE_BUTTON_MASK {
         0 => Some(-MOUSE_WHEEL_ROWS),
         1 => Some(MOUSE_WHEEL_ROWS),
         _ => None,
     }
+}
+
+fn mouse_plain_button(button: u16) -> Option<u16> {
+    (button & (MOUSE_DRAG_FLAG | MOUSE_WHEEL_FLAG) == 0).then_some(button & MOUSE_BUTTON_MASK)
+}
+
+fn mouse_drag_button(button: u16) -> Option<u16> {
+    (button & MOUSE_DRAG_FLAG != 0 && button & MOUSE_WHEEL_FLAG == 0)
+        .then_some(button & MOUSE_BUTTON_MASK)
 }
 
 fn visible_index_for_mouse_row(
@@ -348,6 +360,8 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("x", "kill selected sessions"),
     ("?", "show shortcuts"),
     ("Mouse", "click select; double-click activate"),
+    ("Right click", "pin or unpin session"),
+    ("Drag", "move pinned session up or down"),
     ("Wheel", "scroll sessions"),
     ("q", "quit"),
 ];
@@ -675,26 +689,29 @@ impl App {
             return Ok(false);
         }
 
-        let left_button = event.button & 0b11 == 0 && event.button & 0b100_0000 == 0;
-        if !event.pressed || !left_button || self.prompt.is_some() {
+        if !event.pressed || self.prompt.is_some() {
             return Ok(false);
         }
 
-        let layout = self.layout();
-        let rows = self.visible_rows();
-        let Some(index) = visible_index_for_mouse_row(
-            event.row,
-            layout.list_row_start,
-            self.visible_list_height(),
-            self.top,
-            rows.len(),
-        ) else {
+        if mouse_plain_button(event.button) == Some(2) {
+            return self.handle_right_click(event);
+        }
+        if mouse_drag_button(event.button) == Some(0) {
+            self.last_click = None;
+            self.drag_selected_session_to_mouse_row(event)?;
+            return Ok(false);
+        }
+        if mouse_plain_button(event.button) != Some(0) {
+            return Ok(false);
+        }
+
+        let Some((index, row)) = self.visible_mouse_row(event) else {
             self.last_click = None;
             return Ok(false);
         };
-        let row = rows[index];
         self.selected = index;
 
+        let layout = self.layout();
         let checkbox_start = layout.table_col + 2;
         let checkbox_end = checkbox_start + 2;
         if !self.selected_sessions.is_empty()
@@ -718,6 +735,63 @@ impl App {
             return self.activate_selected();
         }
         Ok(false)
+    }
+
+    fn handle_right_click(&mut self, event: MouseEvent) -> AppResult<bool> {
+        let Some((index, row)) = self.visible_mouse_row(event) else {
+            self.last_click = None;
+            return Ok(false);
+        };
+        self.selected = index;
+        self.last_click = None;
+
+        let VisibleRow::Session(session_index) = row else {
+            self.status = "Right-click a session to pin it".to_string();
+            return Ok(false);
+        };
+        self.toggle_session_pin(session_index)?;
+        Ok(false)
+    }
+
+    fn drag_selected_session_to_mouse_row(&mut self, event: MouseEvent) -> AppResult<()> {
+        let Some((target_index, VisibleRow::Session(_))) = self.visible_mouse_row(event) else {
+            return Ok(());
+        };
+        if !matches!(self.selected_row(), Some(VisibleRow::Session(_))) {
+            return Ok(());
+        }
+
+        let mut remaining = self.visible_rows().len();
+        while self.selected > target_index && remaining > 0 {
+            let previous = self.selected;
+            self.reorder_up()?;
+            if self.selected == previous {
+                break;
+            }
+            remaining -= 1;
+        }
+        while self.selected < target_index && remaining > 0 {
+            let previous = self.selected;
+            self.reorder_down()?;
+            if self.selected == previous {
+                break;
+            }
+            remaining -= 1;
+        }
+        Ok(())
+    }
+
+    fn visible_mouse_row(&self, event: MouseEvent) -> Option<(usize, VisibleRow)> {
+        let layout = self.layout();
+        let rows = self.visible_rows();
+        let index = visible_index_for_mouse_row(
+            event.row,
+            layout.list_row_start,
+            self.visible_list_height(),
+            self.top,
+            rows.len(),
+        )?;
+        Some((index, rows[index]))
     }
 
     fn scroll_visible_rows(&mut self, delta: isize) {
@@ -916,6 +990,10 @@ impl App {
             self.status = "Select a session to pin it".to_string();
             return Ok(());
         };
+        self.toggle_session_pin(session_index)
+    }
+
+    fn toggle_session_pin(&mut self, session_index: usize) -> AppResult<()> {
         let current_name = self.sessions[session_index].name.clone();
         let was_pinned = self.sessions[session_index].pinned;
 
@@ -1818,7 +1896,10 @@ impl TerminalGuard {
         set_termios(fd, &raw_state)?;
 
         let mut stdout = io::stdout().lock();
-        write!(stdout, "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h")?;
+        write!(
+            stdout,
+            "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1002h\x1b[?1006h"
+        )?;
         stdout.flush()?;
 
         Ok(Self { fd, saved_state })
@@ -1829,7 +1910,10 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = set_termios(self.fd, &self.saved_state);
         let mut stdout = io::stdout().lock();
-        let _ = write!(stdout, "\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l");
+        let _ = write!(
+            stdout,
+            "\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l"
+        );
         let _ = stdout.flush();
     }
 }
@@ -2676,6 +2760,64 @@ mod tests {
         assert!(!activated);
         assert_eq!(app.top, 3);
         assert_eq!(app.selected, 3);
+    }
+
+    #[test]
+    fn right_click_pins_session_under_cursor() {
+        let pin_file = temp_state_file("pins");
+        let mut app = app_with_sessions(vec![session("api", 0, false)]);
+        app.pin_file = pin_file.clone();
+        let layout = app.layout();
+
+        app.handle_mouse(MouseEvent {
+            button: 2,
+            col: 5,
+            row: layout.list_row_start + 1,
+            pressed: true,
+        })
+        .unwrap();
+
+        assert!(
+            app.sessions
+                .iter()
+                .any(|session| session.name == "api" && session.pinned)
+        );
+        assert_eq!(fs::read_to_string(&pin_file).unwrap(), "api\n");
+        let _ = fs::remove_file(pin_file);
+    }
+
+    #[test]
+    fn left_drag_reorders_pinned_session_up() {
+        let pin_file = temp_state_file("pins");
+        let mut app =
+            app_with_sessions(vec![session("api", 0, true), session("database", 0, true)]);
+        app.pin_file = pin_file.clone();
+        write_pinned_names(&pin_file, &["api".to_string(), "database".to_string()]).unwrap();
+        let layout = app.layout();
+
+        app.handle_mouse(MouseEvent {
+            button: 0,
+            col: 5,
+            row: layout.list_row_start + 2,
+            pressed: true,
+        })
+        .unwrap();
+        app.handle_mouse(MouseEvent {
+            button: 32,
+            col: 5,
+            row: layout.list_row_start + 1,
+            pressed: true,
+        })
+        .unwrap();
+
+        let names = app
+            .sessions
+            .iter()
+            .map(|session| session.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["database", "api"]);
+        assert_eq!(fs::read_to_string(&pin_file).unwrap(), "database\napi\n");
+        let _ = fs::remove_file(pin_file);
     }
 
     #[test]

@@ -91,6 +91,87 @@ fn mouse_wheel_scrolls_session_list_in_terminal() {
     let _ = fs::remove_dir_all(temp_dir);
 }
 
+#[test]
+fn right_click_pins_session_in_terminal() {
+    let temp_dir = temp_dir("right-click");
+    fs::create_dir_all(&temp_dir).unwrap();
+    let tmux_bin = temp_dir.join("tmux");
+    let sessions_file = temp_dir.join("sessions");
+    let switch_file = temp_dir.join("switched");
+    let pin_file = temp_dir.join("pins");
+    write_fake_tmux(&tmux_bin);
+    write_sessions(&sessions_file, &[("current", 100), ("clicked", 200)]);
+
+    let (mut master, slave) = open_pty(24, 80);
+    let mut child = spawn_picker(
+        &temp_dir,
+        &sessions_file,
+        "current",
+        &switch_file,
+        &pin_file,
+        slave,
+    );
+
+    wait_for_output(&mut master, "clicked", Duration::from_secs(2));
+    master.write_all(b"\x1b[<2;5;21M").unwrap();
+    master.flush().unwrap();
+    wait_for_file_contents(
+        &pin_file,
+        "clicked\n",
+        Duration::from_secs(2),
+        &mut master,
+        &mut child,
+    );
+
+    master.write_all(b"q").unwrap();
+    master.flush().unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success());
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn left_drag_reorders_pinned_session_in_terminal() {
+    let temp_dir = temp_dir("drag");
+    fs::create_dir_all(&temp_dir).unwrap();
+    let tmux_bin = temp_dir.join("tmux");
+    let sessions_file = temp_dir.join("sessions");
+    let switch_file = temp_dir.join("switched");
+    let pin_file = temp_dir.join("pins");
+    write_fake_tmux(&tmux_bin);
+    write_sessions(&sessions_file, &[("current", 100), ("clicked", 200)]);
+    fs::write(&pin_file, "current\nclicked\n").unwrap();
+
+    let (mut master, slave) = open_pty(24, 80);
+    let mut child = spawn_picker(
+        &temp_dir,
+        &sessions_file,
+        "current",
+        &switch_file,
+        &pin_file,
+        slave,
+    );
+
+    wait_for_output(&mut master, "clicked", Duration::from_secs(2));
+    master.write_all(b"\x1b[<0;5;22M\x1b[<32;5;21M").unwrap();
+    master.flush().unwrap();
+    wait_for_file_contents(
+        &pin_file,
+        "clicked\ncurrent\n",
+        Duration::from_secs(2),
+        &mut master,
+        &mut child,
+    );
+
+    master.write_all(b"q").unwrap();
+    master.flush().unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success());
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
 fn temp_dir(suffix: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -250,6 +331,46 @@ fn wait_for_file(path: &Path, timeout: Duration, master: &mut File, child: &mut 
     panic!(
         "timed out waiting for {}; child status: {:?}; extra output: {:?}",
         path.display(),
+        status,
+        output
+    );
+}
+
+fn wait_for_file_contents(
+    path: &Path,
+    expected: &str,
+    timeout: Duration,
+    master: &mut File,
+    child: &mut Child,
+) {
+    let deadline = Instant::now() + timeout;
+    let mut last_contents = String::new();
+    while Instant::now() < deadline {
+        if let Ok(contents) = fs::read_to_string(path) {
+            if contents == expected {
+                return;
+            }
+            last_contents = contents;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let status = child.try_wait().unwrap();
+    let mut output = String::new();
+    let mut buffer = [0_u8; 4096];
+    while input_is_ready(master.as_raw_fd(), Duration::from_millis(10)) {
+        match master.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(size) => output.push_str(&String::from_utf8_lossy(&buffer[..size])),
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    panic!(
+        "timed out waiting for {} to become {:?}; last contents: {:?}; child status: {:?}; extra output: {:?}",
+        path.display(),
+        expected,
+        last_contents,
         status,
         output
     );

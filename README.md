@@ -37,6 +37,8 @@ cargo build --release
 | `q` | Quit |
 | Left click | Move the cursor to a group or session |
 | Double-click | Switch session or toggle group |
+| Left drag | Move a pinned session up or down |
+| Right click | Pin / unpin the session under the cursor |
 | Checkbox click | Toggle a session while selection mode is active |
 | Mouse wheel | Scroll the session list |
 
