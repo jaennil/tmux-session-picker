@@ -362,6 +362,7 @@ fn bulk_pin_target_state(sessions: &[Session], selected_sessions: &BTreeSet<Stri
 
 const SHORTCUTS: &[(&str, &str)] = &[
     ("j/k", "move cursor"),
+    ("Ctrl+j/k", "move between folders"),
     ("g/G", "jump first/last"),
     ("/", "search sessions and groups"),
     ("Backspace", "delete search character"),
@@ -667,6 +668,8 @@ impl App {
             match key {
                 b'j' => self.move_down(),
                 b'k' => self.move_up(),
+                0x0a => self.move_group_down(),
+                0x0b => self.move_group_up(),
                 b'g' => self.jump_first(),
                 b'G' => self.jump_last(),
                 b'/' => {
@@ -688,8 +691,8 @@ impl App {
                 b'?' => self.show_help(),
                 b'J' => self.reorder_down()?,
                 b'K' => self.reorder_up()?,
-                b'\r' | b'\n' if self.activate_selected()? => break,
-                b'\r' | b'\n' => {}
+                b'\r' if self.activate_selected()? => break,
+                b'\r' => {}
                 b'q' | 0x1b | 0x03 => break,
                 _ => {}
             }
@@ -867,10 +870,7 @@ impl App {
     }
 
     fn selected_row(&self) -> Option<VisibleRow> {
-        match self.visible_rows().get(self.selected).copied() {
-            Some(VisibleRow::Session(index)) => Some(VisibleRow::Session(index)),
-            _ => None,
-        }
+        self.visible_rows().get(self.selected).copied()
     }
 
     fn selected_session_index(&self) -> Option<usize> {
@@ -927,6 +927,31 @@ impl App {
 
     fn jump_last(&mut self) {
         self.selected = last_session_row_position(&self.visible_rows());
+    }
+
+    fn move_group_up(&mut self) {
+        let rows = self.visible_rows();
+        if let Some(index) = rows
+            .iter()
+            .enumerate()
+            .take(self.selected.min(rows.len()))
+            .rev()
+            .find_map(|(index, row)| matches!(row, VisibleRow::Group(_)).then_some(index))
+        {
+            self.selected = index;
+        }
+    }
+
+    fn move_group_down(&mut self) {
+        let rows = self.visible_rows();
+        if let Some(index) = rows
+            .iter()
+            .enumerate()
+            .skip(self.selected.saturating_add(1))
+            .find_map(|(index, row)| matches!(row, VisibleRow::Group(_)).then_some(index))
+        {
+            self.selected = index;
+        }
     }
 
     fn has_matches(&self) -> bool {
@@ -1570,7 +1595,6 @@ impl App {
             return;
         }
         self.selected = self.selected.min(row_count - 1);
-        self.selected = nearest_session_row_position(&self.visible_rows(), self.selected);
         let viewport = self.viewport_height();
         if self.selected < self.top {
             self.top = self.selected;
@@ -1680,8 +1704,7 @@ impl App {
     ) -> AppResult<()> {
         let layout = self.layout();
         let row = layout.list_row_start + visible_row;
-        let selected = self.top + visible_row == self.selected
-            && matches!(visible, Some(VisibleRow::Session(_)));
+        let selected = self.top + visible_row == self.selected;
         let pointer = if selected { ">" } else { " " };
 
         let line = match visible {
@@ -2544,13 +2567,50 @@ mod tests {
     }
 
     #[test]
-    fn ensure_visible_moves_selection_off_group_header() {
+    fn ctrl_navigation_moves_between_group_headers() {
+        let mut app = app_with_sessions(vec![
+            session("api", 0, false),
+            session("database", 0, false),
+            session("notes", 0, false),
+        ]);
+        app.groups = GroupState {
+            version: 1,
+            groups: vec![
+                Group {
+                    name: "Work".to_string(),
+                    collapsed: false,
+                    sessions: vec!["api".to_string(), "database".to_string()],
+                },
+                Group {
+                    name: "Personal".to_string(),
+                    collapsed: false,
+                    sessions: vec!["notes".to_string()],
+                },
+            ],
+        };
+        app.selected = 1;
+
+        app.move_group_down();
+        assert_eq!(app.selected_row(), Some(VisibleRow::Group(1)));
+
+        app.move_group_up();
+        assert_eq!(app.selected_row(), Some(VisibleRow::Group(0)));
+    }
+
+    #[test]
+    fn selected_group_can_expand_collapsed_folder() {
         let mut app = app_with_sessions(vec![session("api", 0, false)]);
+        app.ungrouped_collapsed = true;
         app.selected = 0;
 
-        app.ensure_visible();
+        app.activate_selected().unwrap();
 
-        assert_eq!(app.selected_row(), Some(VisibleRow::Session(0)));
+        assert_eq!(app.selected_row(), Some(VisibleRow::Group(0)));
+        assert_eq!(
+            app.visible_rows(),
+            vec![VisibleRow::Group(0), VisibleRow::Session(0)]
+        );
+        assert!(!app.ungrouped_collapsed);
     }
 
     #[test]
@@ -2722,7 +2782,7 @@ mod tests {
 
     #[test]
     fn shortcut_help_popup_marks_current_entry() {
-        let lines = help_popup_lines(1, 3);
+        let lines = help_popup_lines(2, 3);
 
         assert!(lines.iter().any(|line| line.starts_with("> g/G")));
         assert!(lines.last().unwrap().contains("Esc close"));

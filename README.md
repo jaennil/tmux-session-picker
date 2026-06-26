@@ -16,6 +16,7 @@ cargo build --release
 | Key | Action |
 | --- | --- |
 | `j` / `k` | Move selection |
+| `Ctrl+j` / `Ctrl+k` | Move between group headers |
 | `g` / `G` | Jump to first / last session |
 | `/` | Search sessions and groups by name |
 | `Backspace` | Remove the last search character |
@@ -45,5 +46,6 @@ cargo build --release
 Set `TMUX_SESSION_GROUP_FILE` to use another group state file. This is useful
 for testing without changing your normal configuration.
 
-Group headers are displayed but skipped by cursor navigation. The `Ungrouped`
-header is hidden when it has no sessions.
+Group headers are displayed but skipped by normal cursor navigation. Use
+`Ctrl+j` / `Ctrl+k` to select group headers explicitly. The `Ungrouped` header
+is hidden when it has no sessions.

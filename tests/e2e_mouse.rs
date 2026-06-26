@@ -172,6 +172,57 @@ fn left_drag_reorders_pinned_session_in_terminal() {
     let _ = fs::remove_dir_all(temp_dir);
 }
 
+#[test]
+fn ctrl_j_selects_collapsed_group_for_expansion() {
+    let temp_dir = temp_dir("ctrl-group");
+    fs::create_dir_all(&temp_dir).unwrap();
+    let tmux_bin = temp_dir.join("tmux");
+    let sessions_file = temp_dir.join("sessions");
+    let group_file = temp_dir.join("groups.toml");
+    let switch_file = temp_dir.join("switched");
+    let pin_file = temp_dir.join("pins");
+    write_fake_tmux(&tmux_bin);
+    write_sessions(&sessions_file, &[("current", 100), ("clicked", 200)]);
+    fs::write(
+        &group_file,
+        r#"version = 1
+
+[[groups]]
+name = "Work"
+collapsed = true
+sessions = ["current"]
+
+[[groups]]
+name = "Personal"
+collapsed = true
+sessions = ["clicked"]
+"#,
+    )
+    .unwrap();
+
+    let (mut master, slave) = open_pty(24, 80);
+    let mut child = spawn_picker(
+        &temp_dir,
+        &sessions_file,
+        "current",
+        &switch_file,
+        &pin_file,
+        slave,
+    );
+
+    wait_for_output(&mut master, "Personal", Duration::from_secs(2));
+    master.write_all(b"\n\r").unwrap();
+    master.flush().unwrap();
+    wait_for_output(&mut master, "clicked", Duration::from_secs(2));
+
+    master.write_all(b"q").unwrap();
+    master.flush().unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success());
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
 fn temp_dir(suffix: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -280,6 +331,7 @@ fn spawn_picker(
         .env("TMUX_E2E_SESSIONS_FILE", sessions_file)
         .env("TMUX_E2E_SWITCH_FILE", switch_file)
         .env("TMUX_SESSION_PIN_FILE", pin_file)
+        .env("TMUX_SESSION_GROUP_FILE", temp_dir.join("groups.toml"))
         .spawn()
         .unwrap()
 }
