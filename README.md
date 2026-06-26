@@ -35,7 +35,7 @@ cargo build --release
 | `x` | Kill selected sessions after confirmation, or kill highlighted session |
 | `?` | Show shortcut help |
 | `q` | Quit |
-| Left click | Move the cursor to a group or session |
+| Left click | Move the cursor to a session |
 | Double-click | Switch session or toggle group |
 | Left drag | Move a pinned session up or down |
 | Right click | Pin / unpin the session under the cursor |
@@ -44,3 +44,6 @@ cargo build --release
 
 Set `TMUX_SESSION_GROUP_FILE` to use another group state file. This is useful
 for testing without changing your normal configuration.
+
+Group headers are displayed but skipped by cursor navigation. The `Ungrouped`
+header is hidden when it has no sessions.

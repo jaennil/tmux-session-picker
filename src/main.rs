@@ -232,7 +232,7 @@ fn build_visible_rows(
         .map(|(session_index, _)| session_index)
         .collect::<Vec<_>>();
 
-    if !searching || ungrouped_matches || !matching_sessions.is_empty() {
+    if !matching_sessions.is_empty() {
         rows.push(VisibleRow::Group(ungrouped_index));
         if searching || !ungrouped_collapsed {
             rows.extend(matching_sessions.into_iter().map(VisibleRow::Session));
@@ -245,6 +245,27 @@ fn build_visible_rows(
 fn first_session_row_position(rows: &[VisibleRow]) -> usize {
     rows.iter()
         .position(|row| matches!(row, VisibleRow::Session(_)))
+        .unwrap_or(0)
+}
+
+fn last_session_row_position(rows: &[VisibleRow]) -> usize {
+    rows.iter()
+        .rposition(|row| matches!(row, VisibleRow::Session(_)))
+        .unwrap_or(0)
+}
+
+fn nearest_session_row_position(rows: &[VisibleRow], selected: usize) -> usize {
+    rows.iter()
+        .enumerate()
+        .skip(selected.min(rows.len()))
+        .find_map(|(index, row)| matches!(row, VisibleRow::Session(_)).then_some(index))
+        .or_else(|| {
+            rows.iter()
+                .enumerate()
+                .take(selected.min(rows.len()))
+                .rev()
+                .find_map(|(index, row)| matches!(row, VisibleRow::Session(_)).then_some(index))
+        })
         .unwrap_or(0)
 }
 
@@ -359,7 +380,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("J/K", "reorder group or pinned session"),
     ("x", "kill selected sessions"),
     ("?", "show shortcuts"),
-    ("Mouse", "click select; double-click activate"),
+    ("Mouse", "click session; double-click activate"),
     ("Right click", "pin or unpin session"),
     ("Drag", "move pinned session up or down"),
     ("Wheel", "scroll sessions"),
@@ -709,19 +730,6 @@ impl App {
             self.last_click = None;
             return Ok(false);
         };
-        self.selected = index;
-
-        let layout = self.layout();
-        let checkbox_start = layout.table_col + 2;
-        let checkbox_end = checkbox_start + 2;
-        if !self.selected_sessions.is_empty()
-            && matches!(row, VisibleRow::Session(_))
-            && (checkbox_start..=checkbox_end).contains(&event.col)
-        {
-            self.toggle_selected_row_selection();
-            self.last_click = None;
-            return Ok(false);
-        }
 
         let now = Instant::now();
         let repeated = self.last_click.is_some_and(|(previous_row, previous_at)| {
@@ -729,6 +737,27 @@ impl App {
                 && now.saturating_duration_since(previous_at) <= Duration::from_millis(400)
         });
         self.last_click = Some((row, now));
+
+        if let VisibleRow::Group(group_index) = row {
+            if repeated {
+                self.last_click = None;
+                self.toggle_group(group_index)?;
+            }
+            return Ok(false);
+        }
+
+        self.selected = index;
+
+        let layout = self.layout();
+        let checkbox_start = layout.table_col + 2;
+        let checkbox_end = checkbox_start + 2;
+        if !self.selected_sessions.is_empty()
+            && (checkbox_start..=checkbox_end).contains(&event.col)
+        {
+            self.toggle_selected_row_selection();
+            self.last_click = None;
+            return Ok(false);
+        }
 
         if repeated && self.selected_sessions.is_empty() {
             self.last_click = None;
@@ -742,13 +771,13 @@ impl App {
             self.last_click = None;
             return Ok(false);
         };
-        self.selected = index;
         self.last_click = None;
 
         let VisibleRow::Session(session_index) = row else {
             self.status = "Right-click a session to pin it".to_string();
             return Ok(false);
         };
+        self.selected = index;
         self.toggle_session_pin(session_index)?;
         Ok(false)
     }
@@ -811,13 +840,20 @@ impl App {
         };
         self.top = new_top.min(max_top);
         self.selected = self.selected.min(row_count - 1);
-
-        if self.selected < self.top {
-            self.selected = self.top;
-        }
         let bottom = self.top + viewport - 1;
-        if self.selected > bottom {
-            self.selected = bottom;
+        let rows = self.visible_rows();
+
+        if self.selected < self.top
+            || self.selected > bottom
+            || !matches!(rows.get(self.selected), Some(VisibleRow::Session(_)))
+        {
+            self.selected = rows
+                .iter()
+                .enumerate()
+                .skip(self.top)
+                .take(viewport)
+                .find_map(|(index, row)| matches!(row, VisibleRow::Session(_)).then_some(index))
+                .unwrap_or_else(|| nearest_session_row_position(&rows, self.selected));
         }
     }
 
@@ -831,7 +867,10 @@ impl App {
     }
 
     fn selected_row(&self) -> Option<VisibleRow> {
-        self.visible_rows().get(self.selected).copied()
+        match self.visible_rows().get(self.selected).copied() {
+            Some(VisibleRow::Session(index)) => Some(VisibleRow::Session(index)),
+            _ => None,
+        }
     }
 
     fn selected_session_index(&self) -> Option<usize> {
@@ -849,29 +888,45 @@ impl App {
     }
 
     fn select_row(&mut self, target: VisibleRow) {
+        if !matches!(target, VisibleRow::Session(_)) {
+            return;
+        }
         if let Some(index) = self.visible_rows().iter().position(|row| *row == target) {
             self.selected = index;
         }
     }
 
     fn move_up(&mut self) {
-        if self.selected > 0 {
-            self.selected -= 1;
+        let rows = self.visible_rows();
+        if let Some(index) = rows
+            .iter()
+            .enumerate()
+            .take(self.selected.min(rows.len()))
+            .rev()
+            .find_map(|(index, row)| matches!(row, VisibleRow::Session(_)).then_some(index))
+        {
+            self.selected = index;
         }
     }
 
     fn move_down(&mut self) {
-        if self.selected + 1 < self.visible_rows().len() {
-            self.selected += 1;
+        let rows = self.visible_rows();
+        if let Some(index) = rows
+            .iter()
+            .enumerate()
+            .skip(self.selected.saturating_add(1))
+            .find_map(|(index, row)| matches!(row, VisibleRow::Session(_)).then_some(index))
+        {
+            self.selected = index;
         }
     }
 
     fn jump_first(&mut self) {
-        self.selected = 0;
+        self.selected = first_session_row_position(&self.visible_rows());
     }
 
     fn jump_last(&mut self) {
-        self.selected = self.visible_rows().len().saturating_sub(1);
+        self.selected = last_session_row_position(&self.visible_rows());
     }
 
     fn has_matches(&self) -> bool {
@@ -1515,6 +1570,7 @@ impl App {
             return;
         }
         self.selected = self.selected.min(row_count - 1);
+        self.selected = nearest_session_row_position(&self.visible_rows(), self.selected);
         let viewport = self.viewport_height();
         if self.selected < self.top {
             self.top = self.selected;
@@ -1624,7 +1680,8 @@ impl App {
     ) -> AppResult<()> {
         let layout = self.layout();
         let row = layout.list_row_start + visible_row;
-        let selected = self.top + visible_row == self.selected;
+        let selected = self.top + visible_row == self.selected
+            && matches!(visible, Some(VisibleRow::Session(_)));
         let pointer = if selected { ">" } else { " " };
 
         let line = match visible {
@@ -2213,8 +2270,8 @@ mod tests {
     use super::{
         App, MouseEvent, NameAction, Prompt, SHORTCUTS, Session, VisibleRow, arrange_sessions,
         build_visible_rows, bulk_pin_target_state, first_session_row_position,
-        format_relative_activity, help_popup_height, help_popup_lines, mode_line,
-        mouse_wheel_delta, move_popup_lines, next_help_index, parse_mouse_escape,
+        format_relative_activity, help_popup_height, help_popup_lines, last_session_row_position,
+        mode_line, mouse_wheel_delta, move_popup_lines, next_help_index, parse_mouse_escape,
         pinned_names_from_sessions, prune_selected_sessions, selected_count_for_group,
         session_name_matches, session_row_line, toggle_selection_for_group,
         toggle_selection_for_rows, visible_index_for_mouse_row, write_pinned_names,
@@ -2243,11 +2300,14 @@ mod tests {
     }
 
     fn app_with_sessions(sessions: Vec<Session>) -> App {
+        let groups = GroupState::default();
+        let selected =
+            first_session_row_position(&build_visible_rows(&sessions, &groups, "", false));
         App {
             sessions,
-            groups: GroupState::default(),
+            groups,
             selected_sessions: BTreeSet::new(),
-            selected: 0,
+            selected,
             top: 0,
             rows: 24,
             cols: 80,
@@ -2379,7 +2439,7 @@ mod tests {
 
         assert_eq!(
             build_visible_rows(&sessions, &groups, "", false),
-            vec![VisibleRow::Group(0), VisibleRow::Group(1)]
+            vec![VisibleRow::Group(0)]
         );
         assert_eq!(
             build_visible_rows(&sessions, &groups, "data", false),
@@ -2421,6 +2481,76 @@ mod tests {
         assert_eq!(first_session_row_position(&rows), 1);
         assert_eq!(first_session_row_position(&[VisibleRow::Group(0)]), 0);
         assert_eq!(first_session_row_position(&[]), 0);
+        assert_eq!(last_session_row_position(&rows), 2);
+        assert_eq!(last_session_row_position(&[VisibleRow::Group(0)]), 0);
+    }
+
+    #[test]
+    fn visible_rows_hide_empty_ungrouped_group() {
+        let sessions = vec![session("api", 0, false)];
+        let groups = GroupState {
+            version: 1,
+            groups: vec![Group {
+                name: "Work".to_string(),
+                collapsed: false,
+                sessions: vec!["api".to_string()],
+            }],
+        };
+
+        assert_eq!(
+            build_visible_rows(&sessions, &groups, "", false),
+            vec![VisibleRow::Group(0), VisibleRow::Session(0)]
+        );
+    }
+
+    #[test]
+    fn keyboard_navigation_skips_group_headers() {
+        let mut app = app_with_sessions(vec![
+            session("api", 0, false),
+            session("database", 0, false),
+            session("notes", 0, false),
+        ]);
+        app.groups = GroupState {
+            version: 1,
+            groups: vec![
+                Group {
+                    name: "Work".to_string(),
+                    collapsed: false,
+                    sessions: vec!["api".to_string(), "database".to_string()],
+                },
+                Group {
+                    name: "Personal".to_string(),
+                    collapsed: false,
+                    sessions: vec!["notes".to_string()],
+                },
+            ],
+        };
+        app.selected = 1;
+
+        app.move_down();
+        assert_eq!(app.selected_row(), Some(VisibleRow::Session(1)));
+
+        app.move_down();
+        assert_eq!(app.selected_row(), Some(VisibleRow::Session(2)));
+
+        app.move_up();
+        assert_eq!(app.selected_row(), Some(VisibleRow::Session(1)));
+
+        app.jump_first();
+        assert_eq!(app.selected_row(), Some(VisibleRow::Session(0)));
+
+        app.jump_last();
+        assert_eq!(app.selected_row(), Some(VisibleRow::Session(2)));
+    }
+
+    #[test]
+    fn ensure_visible_moves_selection_off_group_header() {
+        let mut app = app_with_sessions(vec![session("api", 0, false)]);
+        app.selected = 0;
+
+        app.ensure_visible();
+
+        assert_eq!(app.selected_row(), Some(VisibleRow::Session(0)));
     }
 
     #[test]
@@ -2873,6 +3003,23 @@ mod tests {
         app.handle_mouse(click).unwrap();
 
         assert!(app.ungrouped_collapsed);
+        assert_eq!(app.selected_row(), None);
+    }
+
+    #[test]
+    fn left_click_group_header_does_not_select_it() {
+        let mut app = app_with_sessions(vec![session("api", 0, false)]);
+        let layout = app.layout();
+
+        app.handle_mouse(MouseEvent {
+            button: 0,
+            col: 4,
+            row: layout.list_row_start,
+            pressed: true,
+        })
+        .unwrap();
+
+        assert_eq!(app.selected_row(), Some(VisibleRow::Session(0)));
     }
 
     #[test]
@@ -2889,7 +3036,7 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(app.selected_row(), Some(VisibleRow::Group(0)));
+        assert_eq!(app.selected_row(), Some(VisibleRow::Session(0)));
         assert!(matches!(app.prompt, Some(Prompt::Help { .. })));
     }
 }
