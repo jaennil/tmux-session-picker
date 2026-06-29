@@ -4,8 +4,9 @@ Small terminal session picker for tmux.
 
 Sessions are shown in two side-by-side views: `Active` on the left and `All` on
 the right. Use `Active` for sessions currently in use; `All` always shows every
-session. Sessions can also be organized into named, collapsible groups. Group
-membership and collapse state are stored in `~/.config/tmux/session-groups.toml`.
+session. The picker starts focused on `Active`. Sessions can also be organized
+into named, collapsible groups. Group membership and collapse state are stored in
+`~/.config/tmux/session-groups.toml`.
 
 ## Build
 

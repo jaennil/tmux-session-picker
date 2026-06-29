@@ -211,7 +211,7 @@ sessions = ["clicked"]
     );
 
     wait_for_output(&mut master, "Personal", Duration::from_secs(2));
-    master.write_all(b"\n\r").unwrap();
+    master.write_all(b"\x0c\n\r").unwrap();
     master.flush().unwrap();
     wait_for_output(&mut master, "clicked", Duration::from_secs(2));
 

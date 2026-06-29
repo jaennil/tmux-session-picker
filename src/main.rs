@@ -689,7 +689,7 @@ impl App {
             top: 0,
             active_selected,
             active_top: 0,
-            focused_view: SessionView::All,
+            focused_view: SessionView::Active,
             rows,
             cols,
             pin_file,
@@ -2651,7 +2651,7 @@ mod tests {
             top: 0,
             active_selected,
             active_top: 0,
-            focused_view: SessionView::All,
+            focused_view: SessionView::Active,
             rows: 24,
             cols: 80,
             pin_file: PathBuf::new(),
@@ -2890,16 +2890,16 @@ mod tests {
         let mut app =
             app_with_sessions(vec![session("api", 0, true), session("database", 0, false)]);
 
-        assert_eq!(app.focused_view, SessionView::All);
-        app.selected = 2;
-
-        app.focus_left_view();
         assert_eq!(app.focused_view, SessionView::Active);
-        assert_eq!(app.selected_row(), Some(VisibleRow::Session(0)));
+        app.selected = 2;
 
         app.focus_right_view();
         assert_eq!(app.focused_view, SessionView::All);
         assert_eq!(app.selected_row(), Some(VisibleRow::Session(1)));
+
+        app.focus_left_view();
+        assert_eq!(app.focused_view, SessionView::Active);
+        assert_eq!(app.selected_row(), Some(VisibleRow::Session(0)));
     }
 
     #[test]
@@ -2911,6 +2911,7 @@ mod tests {
         ]);
         app.pin_file = pin_file.clone();
         app.selected = 1;
+        app.focus_right_view();
 
         app.toggle_pin().unwrap();
         assert!(
@@ -2953,6 +2954,7 @@ mod tests {
             ],
         };
         app.selected = 1;
+        app.focused_view = SessionView::All;
 
         app.move_down();
         assert_eq!(app.selected_row(), Some(VisibleRow::Session(1)));
@@ -2993,6 +2995,7 @@ mod tests {
             ],
         };
         app.selected = 1;
+        app.focused_view = SessionView::All;
 
         app.move_group_down();
         assert_eq!(app.selected_row(), Some(VisibleRow::Group(1)));
@@ -3006,6 +3009,7 @@ mod tests {
         let mut app = app_with_sessions(vec![session("api", 0, false)]);
         app.ungrouped_collapsed = true;
         app.selected = 0;
+        app.focused_view = SessionView::All;
 
         app.activate_selected().unwrap();
 
@@ -3503,6 +3507,7 @@ mod tests {
     #[test]
     fn popup_ignores_mouse_clicks() {
         let mut app = app_with_sessions(vec![session("api", 0, false)]);
+        app.focus_right_view();
         app.show_help();
         let layout = app.layout();
 
