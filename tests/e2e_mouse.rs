@@ -31,7 +31,7 @@ fn mouse_double_click_switches_session_in_terminal() {
     );
 
     wait_for_output(&mut master, "clicked", Duration::from_secs(2));
-    master.write_all(b"\x1b[<0;5;21M\x1b[<0;5;21M").unwrap();
+    master.write_all(b"\x1b[<0;45;21M\x1b[<0;45;21M").unwrap();
     master.flush().unwrap();
 
     let switched = wait_for_file(
@@ -78,10 +78,10 @@ fn mouse_wheel_scrolls_session_list_in_terminal() {
         slave,
     );
 
-    wait_for_output(&mut master, "s19", Duration::from_secs(2));
-    master.write_all(b"\x1b[<65;5;10M").unwrap();
+    wait_for_output(&mut master, "s18", Duration::from_secs(2));
+    master.write_all(b"\x1b[<65;45;10M").unwrap();
     master.flush().unwrap();
-    wait_for_output(&mut master, "s22", Duration::from_secs(2));
+    wait_for_output(&mut master, "s21", Duration::from_secs(2));
 
     master.write_all(b"q").unwrap();
     master.flush().unwrap();
@@ -113,7 +113,7 @@ fn right_click_pins_session_in_terminal() {
     );
 
     wait_for_output(&mut master, "clicked", Duration::from_secs(2));
-    master.write_all(b"\x1b[<2;5;21M").unwrap();
+    master.write_all(b"\x1b[<2;45;21M").unwrap();
     master.flush().unwrap();
     wait_for_file_contents(
         &pin_file,

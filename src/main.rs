@@ -34,6 +34,12 @@ enum VisibleRow {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionView {
+    Active,
+    All,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MouseEvent {
     button: u16,
     col: usize,
@@ -195,11 +201,28 @@ fn read_input_event(fd: RawFd) -> io::Result<InputEvent> {
         .unwrap_or(InputEvent::Key(0x1b)))
 }
 
+#[cfg(test)]
 fn build_visible_rows(
     sessions: &[Session],
     groups: &GroupState,
     query: &str,
     ungrouped_collapsed: bool,
+) -> Vec<VisibleRow> {
+    build_visible_rows_for_view(
+        sessions,
+        groups,
+        query,
+        ungrouped_collapsed,
+        SessionView::All,
+    )
+}
+
+fn build_visible_rows_for_view(
+    sessions: &[Session],
+    groups: &GroupState,
+    query: &str,
+    ungrouped_collapsed: bool,
+    view: SessionView,
 ) -> Vec<VisibleRow> {
     let searching = !query.is_empty();
     let mut rows = Vec::new();
@@ -209,12 +232,18 @@ fn build_visible_rows(
         let matching_sessions = sessions
             .iter()
             .enumerate()
+            .filter(|(_, session)| session_visible_in_view(session, view))
             .filter(|(_, session)| groups.group_for_session(&session.name) == Some(group_index))
             .filter(|(_, session)| group_matches || session_name_matches(&session.name, query))
             .map(|(session_index, _)| session_index)
             .collect::<Vec<_>>();
 
-        if !searching || group_matches || !matching_sessions.is_empty() {
+        let show_group = match view {
+            SessionView::Active => !matching_sessions.is_empty(),
+            SessionView::All => !searching || group_matches || !matching_sessions.is_empty(),
+        };
+
+        if show_group {
             rows.push(VisibleRow::Group(group_index));
             if searching || !group.collapsed {
                 rows.extend(matching_sessions.into_iter().map(VisibleRow::Session));
@@ -227,6 +256,7 @@ fn build_visible_rows(
     let matching_sessions = sessions
         .iter()
         .enumerate()
+        .filter(|(_, session)| session_visible_in_view(session, view))
         .filter(|(_, session)| groups.group_for_session(&session.name).is_none())
         .filter(|(_, session)| ungrouped_matches || session_name_matches(&session.name, query))
         .map(|(session_index, _)| session_index)
@@ -240,6 +270,13 @@ fn build_visible_rows(
     }
 
     rows
+}
+
+fn session_visible_in_view(session: &Session, view: SessionView) -> bool {
+    match view {
+        SessionView::Active => session.pinned,
+        SessionView::All => true,
+    }
 }
 
 fn first_session_row_position(rows: &[VisibleRow]) -> usize {
@@ -269,14 +306,16 @@ fn nearest_session_row_position(rows: &[VisibleRow], selected: usize) -> usize {
         .unwrap_or(0)
 }
 
-fn session_indices_for_group(
+fn session_indices_for_group_in_view(
     sessions: &[Session],
     groups: &GroupState,
     group_index: usize,
+    view: SessionView,
 ) -> Vec<usize> {
     sessions
         .iter()
         .enumerate()
+        .filter(|(_, session)| session_visible_in_view(session, view))
         .filter_map(|(session_index, session)| {
             let session_group = groups.group_for_session(&session.name);
             let target_group = (group_index < groups.groups.len()).then_some(group_index);
@@ -285,13 +324,30 @@ fn session_indices_for_group(
         .collect()
 }
 
+#[cfg(test)]
 fn selected_count_for_group(
     sessions: &[Session],
     groups: &GroupState,
     selected_sessions: &BTreeSet<String>,
     group_index: usize,
 ) -> (usize, usize) {
-    let group_sessions = session_indices_for_group(sessions, groups, group_index);
+    selected_count_for_group_in_view(
+        sessions,
+        groups,
+        selected_sessions,
+        group_index,
+        SessionView::All,
+    )
+}
+
+fn selected_count_for_group_in_view(
+    sessions: &[Session],
+    groups: &GroupState,
+    selected_sessions: &BTreeSet<String>,
+    group_index: usize,
+    view: SessionView,
+) -> (usize, usize) {
+    let group_sessions = session_indices_for_group_in_view(sessions, groups, group_index, view);
     let selected = group_sessions
         .iter()
         .filter(|index| selected_sessions.contains(&sessions[**index].name))
@@ -305,13 +361,30 @@ fn toggle_selection_for_session(selected_sessions: &mut BTreeSet<String>, sessio
     }
 }
 
+#[cfg(test)]
 fn toggle_selection_for_group(
     selected_sessions: &mut BTreeSet<String>,
     sessions: &[Session],
     groups: &GroupState,
     group_index: usize,
 ) {
-    let group_sessions = session_indices_for_group(sessions, groups, group_index);
+    toggle_selection_for_group_in_view(
+        selected_sessions,
+        sessions,
+        groups,
+        group_index,
+        SessionView::All,
+    );
+}
+
+fn toggle_selection_for_group_in_view(
+    selected_sessions: &mut BTreeSet<String>,
+    sessions: &[Session],
+    groups: &GroupState,
+    group_index: usize,
+    view: SessionView,
+) {
+    let group_sessions = session_indices_for_group_in_view(sessions, groups, group_index, view);
     let all_selected = group_sessions
         .iter()
         .all(|index| selected_sessions.contains(&sessions[*index].name));
@@ -354,6 +427,7 @@ fn prune_selected_sessions(selected_sessions: &mut BTreeSet<String>, sessions: &
     selected_sessions.retain(|name| sessions.iter().any(|session| session.name == *name));
 }
 
+#[cfg(test)]
 fn bulk_pin_target_state(sessions: &[Session], selected_sessions: &BTreeSet<String>) -> bool {
     sessions
         .iter()
@@ -362,6 +436,7 @@ fn bulk_pin_target_state(sessions: &[Session], selected_sessions: &BTreeSet<Stri
 
 const SHORTCUTS: &[(&str, &str)] = &[
     ("j/k", "move cursor"),
+    ("Ctrl+h/l", "switch Active/All view"),
     ("Ctrl+j/k", "move between folders"),
     ("g/G", "jump first/last"),
     ("/", "search sessions and groups"),
@@ -377,13 +452,13 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("m", "move selected or highlighted sessions"),
     ("r", "rename group"),
     ("d", "delete group"),
-    ("p", "pin or unpin selected sessions"),
-    ("J/K", "reorder group or pinned session"),
+    ("p", "add to or remove from Active"),
+    ("J/K", "reorder group or active session"),
     ("x", "kill selected sessions"),
     ("?", "show shortcuts"),
     ("Mouse", "click session; double-click activate"),
-    ("Right click", "pin or unpin session"),
-    ("Drag", "move pinned session up or down"),
+    ("Right click", "add/remove session from Active"),
+    ("Drag", "move active session up or down"),
     ("Wheel", "scroll sessions"),
     ("q", "quit"),
 ];
@@ -441,7 +516,12 @@ fn mode_line(
     query: &str,
     has_matches: bool,
     selected_count: usize,
+    focused_view: SessionView,
 ) -> String {
+    let view = match focused_view {
+        SessionView::Active => "Active",
+        SessionView::All => "All",
+    };
     match prompt {
         Some(Prompt::Name { label, value, .. }) => {
             format!("MODE input: {label}: {value}_")
@@ -461,12 +541,14 @@ fn mode_line(
         Some(Prompt::Help { .. }) => "MODE help: j/k scroll  Esc close".to_string(),
         None if searching => {
             let suffix = if has_matches { "" } else { "  no matches" };
-            format!("MODE search: /{query}{suffix}")
+            format!("MODE search {view}: /{query}{suffix}")
         }
         None if selected_count > 0 => {
-            format!("MODE selection: {selected_count} sessions  m move  p pin  x kill  v clear")
+            format!(
+                "MODE selection {view}: {selected_count} sessions  m move  p active  x kill  v clear"
+            )
         }
-        None => "MODE normal: j/k move  Space select  / search  ? help".to_string(),
+        None => format!("MODE normal {view}: Ctrl+h/l view  j/k move  p active  ? help"),
     }
 }
 
@@ -477,13 +559,13 @@ fn session_row_line(
     name_width: usize,
     activity_width: usize,
 ) -> String {
-    let pin = if session.pinned { "!" } else { " " };
+    let active = if session.pinned { "A" } else { " " };
     let current = if session.is_current { "*" } else { "" };
     let last = format_relative_activity(session.last_activity);
 
     if selected_sessions.is_empty() {
         return format!(
-            "{pointer}   {:<name_width$}  {:>activity_width$}  {:^3} {pin}",
+            "{pointer}   {:<name_width$}  {:>activity_width$}  {:^3} {active}",
             session.name, last, current,
         );
     }
@@ -494,7 +576,7 @@ fn session_row_line(
         "[ ]"
     };
     format!(
-        "{pointer} {checkbox} {:<name_width$}  {:>activity_width$}  {:^3} {pin}",
+        "{pointer} {checkbox} {:<name_width$}  {:>activity_width$}  {:^3} {active}",
         session.name, last, current,
     )
 }
@@ -512,6 +594,9 @@ struct App {
     selected_sessions: BTreeSet<String>,
     selected: usize,
     top: usize,
+    active_selected: usize,
+    active_top: usize,
+    focused_view: SessionView,
     rows: usize,
     cols: usize,
     pin_file: PathBuf,
@@ -523,7 +608,7 @@ struct App {
     searching: bool,
     ungrouped_collapsed: bool,
     prompt: Option<Prompt>,
-    last_click: Option<(VisibleRow, Instant)>,
+    last_click: Option<(SessionView, VisibleRow, Instant)>,
 }
 
 #[derive(Clone)]
@@ -556,10 +641,16 @@ enum Prompt {
 }
 
 struct Layout {
-    table_col: usize,
+    active_col: usize,
+    all_col: usize,
+    active_width: usize,
+    all_width: usize,
     name_width: usize,
     activity_width: usize,
+    mode_row: usize,
+    header_row: usize,
     list_row_start: usize,
+    list_height: usize,
     blank_row: usize,
     status_row: usize,
 }
@@ -578,11 +669,17 @@ impl App {
             .iter()
             .position(|session| session.is_current)
             .unwrap_or(0);
-        let visible_rows = build_visible_rows(&sessions, &groups, "", false);
-        let selected = visible_rows
+        let all_rows = build_visible_rows_for_view(&sessions, &groups, "", false, SessionView::All);
+        let selected = all_rows
             .iter()
             .position(|row| *row == VisibleRow::Session(current_session))
             .unwrap_or(0);
+        let active_rows =
+            build_visible_rows_for_view(&sessions, &groups, "", false, SessionView::Active);
+        let active_selected = active_rows
+            .iter()
+            .position(|row| *row == VisibleRow::Session(current_session))
+            .unwrap_or_else(|| first_session_row_position(&active_rows));
 
         Ok(Self {
             sessions,
@@ -590,6 +687,9 @@ impl App {
             selected_sessions: BTreeSet::new(),
             selected,
             top: 0,
+            active_selected,
+            active_top: 0,
+            focused_view: SessionView::All,
             rows,
             cols,
             pin_file,
@@ -668,6 +768,8 @@ impl App {
             match key {
                 b'j' => self.move_down(),
                 b'k' => self.move_up(),
+                0x08 => self.focus_left_view(),
+                0x0c => self.focus_right_view(),
                 0x0a => self.move_group_down(),
                 0x0b => self.move_group_up(),
                 b'g' => self.jump_first(),
@@ -707,6 +809,9 @@ impl App {
     fn handle_mouse(&mut self, event: MouseEvent) -> AppResult<bool> {
         if let Some(delta) = mouse_wheel_delta(event.button) {
             if event.pressed && self.prompt.is_none() {
+                if let Some(view) = self.view_for_mouse_col(event.col) {
+                    self.focused_view = view;
+                }
                 self.scroll_visible_rows(delta);
             }
             self.last_click = None;
@@ -729,17 +834,21 @@ impl App {
             return Ok(false);
         }
 
-        let Some((index, row)) = self.visible_mouse_row(event) else {
+        let Some((view, index, row)) = self.visible_mouse_row(event) else {
             self.last_click = None;
             return Ok(false);
         };
+        self.focused_view = view;
 
         let now = Instant::now();
-        let repeated = self.last_click.is_some_and(|(previous_row, previous_at)| {
-            previous_row == row
-                && now.saturating_duration_since(previous_at) <= Duration::from_millis(400)
-        });
-        self.last_click = Some((row, now));
+        let repeated = self
+            .last_click
+            .is_some_and(|(previous_view, previous_row, previous_at)| {
+                previous_view == view
+                    && previous_row == row
+                    && now.saturating_duration_since(previous_at) <= Duration::from_millis(400)
+            });
+        self.last_click = Some((view, row, now));
 
         if let VisibleRow::Group(group_index) = row {
             if repeated {
@@ -749,10 +858,10 @@ impl App {
             return Ok(false);
         }
 
-        self.selected = index;
+        self.set_selected_for_view(view, index);
 
-        let layout = self.layout();
-        let checkbox_start = layout.table_col + 2;
+        let pane_col = self.pane_col(view);
+        let checkbox_start = pane_col + 2;
         let checkbox_end = checkbox_start + 2;
         if !self.selected_sessions.is_empty()
             && (checkbox_start..=checkbox_end).contains(&event.col)
@@ -770,42 +879,45 @@ impl App {
     }
 
     fn handle_right_click(&mut self, event: MouseEvent) -> AppResult<bool> {
-        let Some((index, row)) = self.visible_mouse_row(event) else {
+        let Some((view, index, row)) = self.visible_mouse_row(event) else {
             self.last_click = None;
             return Ok(false);
         };
         self.last_click = None;
+        self.focused_view = view;
 
         let VisibleRow::Session(session_index) = row else {
-            self.status = "Right-click a session to pin it".to_string();
+            self.status = "Right-click a session to mark active".to_string();
             return Ok(false);
         };
-        self.selected = index;
+        self.set_selected_for_view(view, index);
         self.toggle_session_pin(session_index)?;
         Ok(false)
     }
 
     fn drag_selected_session_to_mouse_row(&mut self, event: MouseEvent) -> AppResult<()> {
-        let Some((target_index, VisibleRow::Session(_))) = self.visible_mouse_row(event) else {
+        let Some((view, target_index, VisibleRow::Session(_))) = self.visible_mouse_row(event)
+        else {
             return Ok(());
         };
+        self.focused_view = view;
         if !matches!(self.selected_row(), Some(VisibleRow::Session(_))) {
             return Ok(());
         }
 
         let mut remaining = self.visible_rows().len();
-        while self.selected > target_index && remaining > 0 {
-            let previous = self.selected;
+        while self.selected_for_view(view) > target_index && remaining > 0 {
+            let previous = self.selected_for_view(view);
             self.reorder_up()?;
-            if self.selected == previous {
+            if self.selected_for_view(view) == previous {
                 break;
             }
             remaining -= 1;
         }
-        while self.selected < target_index && remaining > 0 {
-            let previous = self.selected;
+        while self.selected_for_view(view) < target_index && remaining > 0 {
+            let previous = self.selected_for_view(view);
             self.reorder_down()?;
-            if self.selected == previous {
+            if self.selected_for_view(view) == previous {
                 break;
             }
             remaining -= 1;
@@ -813,64 +925,154 @@ impl App {
         Ok(())
     }
 
-    fn visible_mouse_row(&self, event: MouseEvent) -> Option<(usize, VisibleRow)> {
+    fn visible_mouse_row(&self, event: MouseEvent) -> Option<(SessionView, usize, VisibleRow)> {
         let layout = self.layout();
-        let rows = self.visible_rows();
+        let view = self.view_for_mouse_col(event.col)?;
+        let rows = self.visible_rows_for_view(view);
         let index = visible_index_for_mouse_row(
             event.row,
             layout.list_row_start,
-            self.visible_list_height(),
-            self.top,
+            layout.list_height,
+            self.top_for_view(view),
             rows.len(),
         )?;
-        Some((index, rows[index]))
+        Some((view, index, rows[index]))
+    }
+
+    fn view_for_mouse_col(&self, col: usize) -> Option<SessionView> {
+        let layout = self.layout();
+        if (layout.active_col..layout.active_col + layout.active_width).contains(&col) {
+            return Some(SessionView::Active);
+        }
+        if (layout.all_col..layout.all_col + layout.all_width).contains(&col) {
+            return Some(SessionView::All);
+        }
+        None
+    }
+
+    fn pane_col(&self, view: SessionView) -> usize {
+        let layout = self.layout();
+        match view {
+            SessionView::Active => layout.active_col,
+            SessionView::All => layout.all_col,
+        }
     }
 
     fn scroll_visible_rows(&mut self, delta: isize) {
         let row_count = self.visible_rows().len();
         if row_count == 0 {
-            self.selected = 0;
-            self.top = 0;
+            self.set_selected_for_view(self.focused_view, 0);
+            self.set_top_for_view(self.focused_view, 0);
             return;
         }
 
         let viewport = self.viewport_height().min(row_count);
         let max_top = row_count.saturating_sub(viewport);
+        let top = self.top_for_view(self.focused_view);
         let new_top = if delta.is_negative() {
-            self.top.saturating_sub(delta.unsigned_abs())
+            top.saturating_sub(delta.unsigned_abs())
         } else {
-            self.top.saturating_add(delta as usize)
+            top.saturating_add(delta as usize)
         };
-        self.top = new_top.min(max_top);
-        self.selected = self.selected.min(row_count - 1);
-        let bottom = self.top + viewport - 1;
+        let top = new_top.min(max_top);
+        self.set_top_for_view(self.focused_view, top);
+        let selected = self
+            .selected_for_view(self.focused_view)
+            .min(row_count.saturating_sub(1));
+        self.set_selected_for_view(self.focused_view, selected);
+        let bottom = top + viewport - 1;
         let rows = self.visible_rows();
 
-        if self.selected < self.top
-            || self.selected > bottom
-            || !matches!(rows.get(self.selected), Some(VisibleRow::Session(_)))
+        if selected < top
+            || selected > bottom
+            || !matches!(rows.get(selected), Some(VisibleRow::Session(_)))
         {
-            self.selected = rows
+            let selected = rows
                 .iter()
                 .enumerate()
-                .skip(self.top)
+                .skip(top)
                 .take(viewport)
                 .find_map(|(index, row)| matches!(row, VisibleRow::Session(_)).then_some(index))
-                .unwrap_or_else(|| nearest_session_row_position(&rows, self.selected));
+                .unwrap_or_else(|| nearest_session_row_position(&rows, selected));
+            self.set_selected_for_view(self.focused_view, selected);
         }
     }
 
     fn visible_rows(&self) -> Vec<VisibleRow> {
-        build_visible_rows(
+        self.visible_rows_for_view(self.focused_view)
+    }
+
+    fn visible_rows_for_view(&self, view: SessionView) -> Vec<VisibleRow> {
+        build_visible_rows_for_view(
             &self.sessions,
             &self.groups,
             &self.query,
             self.ungrouped_collapsed,
+            view,
         )
     }
 
+    fn selected_for_view(&self, view: SessionView) -> usize {
+        match view {
+            SessionView::Active => self.active_selected,
+            SessionView::All => self.selected,
+        }
+    }
+
+    fn set_selected_for_view(&mut self, view: SessionView, selected: usize) {
+        match view {
+            SessionView::Active => self.active_selected = selected,
+            SessionView::All => self.selected = selected,
+        }
+    }
+
+    fn top_for_view(&self, view: SessionView) -> usize {
+        match view {
+            SessionView::Active => self.active_top,
+            SessionView::All => self.top,
+        }
+    }
+
+    fn set_top_for_view(&mut self, view: SessionView, top: usize) {
+        match view {
+            SessionView::Active => self.active_top = top,
+            SessionView::All => self.top = top,
+        }
+    }
+
+    fn selected_row_for_view(&self, view: SessionView) -> Option<VisibleRow> {
+        self.visible_rows_for_view(view)
+            .get(self.selected_for_view(view))
+            .copied()
+    }
+
+    fn focus_left_view(&mut self) {
+        self.focused_view = SessionView::Active;
+        self.ensure_visible();
+        self.select_first_session_in_view_if_needed(SessionView::Active);
+        self.status = "Focused Active view".to_string();
+    }
+
+    fn focus_right_view(&mut self) {
+        self.focused_view = SessionView::All;
+        self.ensure_visible();
+        self.select_first_session_in_view_if_needed(SessionView::All);
+        self.status = "Focused All view".to_string();
+    }
+
+    fn select_first_session_in_view_if_needed(&mut self, view: SessionView) {
+        if matches!(
+            self.selected_row_for_view(view),
+            Some(VisibleRow::Session(_))
+        ) {
+            return;
+        }
+        let rows = self.visible_rows_for_view(view);
+        self.set_selected_for_view(view, first_session_row_position(&rows));
+    }
+
     fn selected_row(&self) -> Option<VisibleRow> {
-        self.visible_rows().get(self.selected).copied()
+        self.selected_row_for_view(self.focused_view)
     }
 
     fn selected_session_index(&self) -> Option<usize> {
@@ -892,65 +1094,75 @@ impl App {
             return;
         }
         if let Some(index) = self.visible_rows().iter().position(|row| *row == target) {
-            self.selected = index;
+            self.set_selected_for_view(self.focused_view, index);
         }
     }
 
     fn move_up(&mut self) {
         let rows = self.visible_rows();
+        let selected = self.selected_for_view(self.focused_view);
         if let Some(index) = rows
             .iter()
             .enumerate()
-            .take(self.selected.min(rows.len()))
+            .take(selected.min(rows.len()))
             .rev()
             .find_map(|(index, row)| matches!(row, VisibleRow::Session(_)).then_some(index))
         {
-            self.selected = index;
+            self.set_selected_for_view(self.focused_view, index);
         }
     }
 
     fn move_down(&mut self) {
         let rows = self.visible_rows();
+        let selected = self.selected_for_view(self.focused_view);
         if let Some(index) = rows
             .iter()
             .enumerate()
-            .skip(self.selected.saturating_add(1))
+            .skip(selected.saturating_add(1))
             .find_map(|(index, row)| matches!(row, VisibleRow::Session(_)).then_some(index))
         {
-            self.selected = index;
+            self.set_selected_for_view(self.focused_view, index);
         }
     }
 
     fn jump_first(&mut self) {
-        self.selected = first_session_row_position(&self.visible_rows());
+        self.set_selected_for_view(
+            self.focused_view,
+            first_session_row_position(&self.visible_rows()),
+        );
     }
 
     fn jump_last(&mut self) {
-        self.selected = last_session_row_position(&self.visible_rows());
+        self.set_selected_for_view(
+            self.focused_view,
+            last_session_row_position(&self.visible_rows()),
+        );
     }
 
     fn move_group_up(&mut self) {
         let rows = self.visible_rows();
+        let selected = self.selected_for_view(self.focused_view);
         if let Some(index) = rows
             .iter()
             .enumerate()
-            .take(self.selected.min(rows.len()))
+            .take(selected.min(rows.len()))
             .rev()
             .find_map(|(index, row)| matches!(row, VisibleRow::Group(_)).then_some(index))
         {
-            self.selected = index;
+            self.set_selected_for_view(self.focused_view, index);
         }
     }
 
     fn move_group_down(&mut self) {
         let rows = self.visible_rows();
+        let selected = self.selected_for_view(self.focused_view);
         if let Some(index) = rows
             .iter()
             .enumerate()
-            .skip(self.selected.saturating_add(1))
+            .skip(selected.saturating_add(1))
             .find_map(|(index, row)| matches!(row, VisibleRow::Group(_)).then_some(index))
         {
-            self.selected = index;
+            self.set_selected_for_view(self.focused_view, index);
         }
     }
 
@@ -959,8 +1171,11 @@ impl App {
     }
 
     fn select_first_match(&mut self) {
-        self.selected = first_session_row_position(&self.visible_rows());
-        self.top = 0;
+        self.set_selected_for_view(
+            self.focused_view,
+            first_session_row_position(&self.visible_rows()),
+        );
+        self.set_top_for_view(self.focused_view, 0);
     }
 
     fn reorder_up(&mut self) -> AppResult<()> {
@@ -981,7 +1196,7 @@ impl App {
             return Ok(());
         };
         if !self.sessions[session_index].pinned {
-            self.status = "Pin session first".to_string();
+            self.status = "Mark session active first".to_string();
             return Ok(());
         }
         let group_index = self
@@ -992,7 +1207,7 @@ impl App {
                 && self.groups.group_for_session(&self.sessions[*index].name) == group_index
         });
         let Some(previous) = previous else {
-            self.status = "Pinned session is already first".to_string();
+            self.status = "Active session is already first".to_string();
             return Ok(());
         };
 
@@ -1022,7 +1237,7 @@ impl App {
             return Ok(());
         };
         if !self.sessions[session_index].pinned {
-            self.status = "Pin session first".to_string();
+            self.status = "Mark session active first".to_string();
             return Ok(());
         }
         let group_index = self
@@ -1033,7 +1248,7 @@ impl App {
                 && self.groups.group_for_session(&self.sessions[*index].name) == group_index
         });
         let Some(next) = next else {
-            self.status = "Pinned session is already last".to_string();
+            self.status = "Active session is already last".to_string();
             return Ok(());
         };
 
@@ -1046,8 +1261,8 @@ impl App {
     }
 
     fn toggle_pin(&mut self) -> AppResult<()> {
+        let target_state = self.focused_view == SessionView::All;
         if !self.selected_sessions.is_empty() {
-            let target_state = bulk_pin_target_state(&self.sessions, &self.selected_sessions);
             let selected_count = self.selected_live_session_names().len();
             for session in &mut self.sessions {
                 if self.selected_sessions.contains(&session.name) {
@@ -1059,36 +1274,45 @@ impl App {
             arrange_sessions(&mut self.sessions, &pinned_names);
             self.write_pins()?;
             self.status = if target_state {
-                format!("Pinned {selected_count} sessions")
+                format!("Marked {selected_count} sessions active")
             } else {
-                format!("Unpinned {selected_count} sessions")
+                format!("Removed {selected_count} sessions from Active")
             };
             return Ok(());
         }
 
         let Some(session_index) = self.selected_session_index() else {
-            self.status = "Select a session to pin it".to_string();
+            self.status = "Select a session to mark active".to_string();
             return Ok(());
         };
         self.toggle_session_pin(session_index)
     }
 
     fn toggle_session_pin(&mut self, session_index: usize) -> AppResult<()> {
+        let target_state = self.focused_view == SessionView::All;
+        self.set_session_active(session_index, target_state)
+    }
+
+    fn set_session_active(&mut self, session_index: usize, active: bool) -> AppResult<()> {
         let current_name = self.sessions[session_index].name.clone();
         let was_pinned = self.sessions[session_index].pinned;
 
         if let Some(session) = self.sessions.get_mut(session_index) {
-            session.pinned = !session.pinned;
+            session.pinned = active;
         }
 
         let pinned_names = pinned_names_from_sessions(&self.sessions);
         arrange_sessions(&mut self.sessions, &pinned_names);
         self.select_session_by_name(&current_name);
         self.write_pins()?;
-        self.status = if was_pinned {
-            format!("Unpinned {current_name}")
+        self.status = if active && !was_pinned {
+            format!("Added {current_name} to Active")
+        } else if !active && was_pinned {
+            format!("Removed {current_name} from Active")
+        } else if active {
+            format!("{current_name} already active")
         } else {
-            format!("Pinned {current_name}")
+            format!("{current_name} already inactive")
         };
         Ok(())
     }
@@ -1459,11 +1683,12 @@ impl App {
                 &mut self.selected_sessions,
                 &self.sessions[index].name,
             ),
-            Some(VisibleRow::Group(index)) => toggle_selection_for_group(
+            Some(VisibleRow::Group(index)) => toggle_selection_for_group_in_view(
                 &mut self.selected_sessions,
                 &self.sessions,
                 &self.groups,
                 index,
+                self.focused_view,
             ),
             None => {}
         }
@@ -1479,11 +1704,12 @@ impl App {
                 .unwrap_or(self.groups.groups.len()),
             None => return,
         };
-        toggle_selection_for_group(
+        toggle_selection_for_group_in_view(
             &mut self.selected_sessions,
             &self.sessions,
             &self.groups,
             group_index,
+            self.focused_view,
         );
         self.update_selection_status();
     }
@@ -1526,9 +1752,11 @@ impl App {
             .delete_group(group_index)
             .map_err(|err| -> Box<dyn Error> { err.into() })?;
         self.write_groups()?;
-        self.selected = self
-            .selected
-            .min(self.visible_rows().len().saturating_sub(1));
+        self.set_selected_for_view(
+            self.focused_view,
+            self.selected_for_view(self.focused_view)
+                .min(self.visible_rows().len().saturating_sub(1)),
+        );
         self.status = format!("Deleted {name}; sessions are ungrouped");
         Ok(())
     }
@@ -1588,28 +1816,40 @@ impl App {
     }
 
     fn ensure_visible(&mut self) {
-        let row_count = self.visible_rows().len();
+        self.ensure_view_visible(SessionView::Active);
+        self.ensure_view_visible(SessionView::All);
+    }
+
+    fn ensure_view_visible(&mut self, view: SessionView) {
+        let row_count = self.visible_rows_for_view(view).len();
         if row_count == 0 {
-            self.selected = 0;
-            self.top = 0;
+            self.set_selected_for_view(view, 0);
+            self.set_top_for_view(view, 0);
             return;
         }
-        self.selected = self.selected.min(row_count - 1);
+        let selected = self.selected_for_view(view).min(row_count - 1);
+        self.set_selected_for_view(view, selected);
         let viewport = self.viewport_height();
-        if self.selected < self.top {
-            self.top = self.selected;
-        } else if self.selected >= self.top + viewport {
-            self.top = self.selected + 1 - viewport;
+        let top = self.top_for_view(view);
+        if selected < top {
+            self.set_top_for_view(view, selected);
+        } else if selected >= top + viewport {
+            self.set_top_for_view(view, selected + 1 - viewport);
         }
     }
 
     fn viewport_height(&self) -> usize {
-        let reserved_rows = 4;
+        let reserved_rows = 5;
         self.rows.saturating_sub(reserved_rows).max(1)
     }
 
     fn visible_list_height(&self) -> usize {
-        self.viewport_height().min(self.visible_rows().len().max(1))
+        let row_count = self
+            .visible_rows_for_view(SessionView::Active)
+            .len()
+            .max(self.visible_rows_for_view(SessionView::All).len())
+            .max(1);
+        self.viewport_height().min(row_count)
     }
 
     fn layout(&self) -> Layout {
@@ -1625,29 +1865,41 @@ impl App {
             )
             .max()
             .unwrap_or(8);
-        let min_name_width = 16;
+        let pane_gap = 2;
+        let active_width = self.cols.saturating_sub(pane_gap) / 2;
+        let all_width = self.cols.saturating_sub(active_width + pane_gap);
+        let pane_width = active_width.min(all_width).max(1);
+        let min_name_width = 8;
         let activity_width = 4;
-        let fixed_width = 7 + min_name_width + 2 + activity_width + 2 + 3;
+        let fixed_width = 18;
         let max_name_width = self
             .cols
+            .min(pane_width)
             .saturating_sub(fixed_width)
             .clamp(min_name_width, max_name_width.max(min_name_width));
         let name_width = max_name_width.max(min_name_width).min(max_name_width);
-        let table_width = 2 + name_width + 2 + activity_width + 2 + 3;
         let list_height = self.visible_list_height();
-        let content_height = list_height + 2;
+        let content_height = list_height + 3;
         let top_padding = self.rows.saturating_sub(content_height);
-        let _table_width = table_width;
-        let table_col = 1;
-        let list_row_start = top_padding + 1;
+        let mode_row = top_padding.max(1);
+        let header_row = top_padding + 1;
+        let list_row_start = header_row + 1;
         let blank_row = list_row_start + list_height;
         let status_row = blank_row + 1;
+        let active_col = 1;
+        let all_col = active_col + active_width + pane_gap;
 
         Layout {
-            table_col,
+            active_col,
+            all_col,
+            active_width,
+            all_width,
             name_width,
             activity_width,
+            mode_row,
+            header_row,
             list_row_start,
+            list_height,
             blank_row,
             status_row,
         }
@@ -1667,19 +1919,19 @@ impl App {
 
     fn render_static(&self, stdout: &mut impl Write) -> AppResult<()> {
         let layout = self.layout();
-        if layout.list_row_start > 1 {
-            let row = layout.list_row_start - 1;
+        if layout.mode_row > 0 {
             let label = mode_line(
                 self.prompt.as_ref(),
                 self.searching,
                 &self.query,
                 self.has_matches(),
                 self.selected_live_session_names().len(),
+                self.focused_view,
             );
             write_at(
                 stdout,
-                row,
-                layout.table_col,
+                layout.mode_row,
+                1,
                 &truncate(&label, self.cols),
                 false,
             )?;
@@ -1688,23 +1940,66 @@ impl App {
     }
 
     fn render_list_area(&self, stdout: &mut impl Write) -> AppResult<()> {
-        let rows = self.visible_rows();
-        for visible_row in 0..self.visible_list_height() {
-            let row = rows.get(self.top + visible_row).copied();
-            self.render_row_at(stdout, visible_row, row)?;
+        let layout = self.layout();
+        write_row(stdout, layout.header_row, "", false)?;
+        self.render_pane_header(stdout, SessionView::Active)?;
+        self.render_pane_header(stdout, SessionView::All)?;
+
+        let active_rows = self.visible_rows_for_view(SessionView::Active);
+        let all_rows = self.visible_rows_for_view(SessionView::All);
+        for visible_row in 0..layout.list_height {
+            let row = layout.list_row_start + visible_row;
+            write_row(stdout, row, "", false)?;
+            let active_top = self.top_for_view(SessionView::Active);
+            let all_top = self.top_for_view(SessionView::All);
+            self.render_pane_row_at(
+                stdout,
+                SessionView::Active,
+                visible_row,
+                active_rows.get(active_top + visible_row).copied(),
+            )?;
+            self.render_pane_row_at(
+                stdout,
+                SessionView::All,
+                visible_row,
+                all_rows.get(all_top + visible_row).copied(),
+            )?;
         }
         Ok(())
     }
 
-    fn render_row_at(
+    fn render_pane_header(&self, stdout: &mut impl Write, view: SessionView) -> AppResult<()> {
+        let layout = self.layout();
+        let (col, width, label, count) = match view {
+            SessionView::Active => (
+                layout.active_col,
+                layout.active_width,
+                "Active",
+                self.sessions
+                    .iter()
+                    .filter(|session| session.pinned)
+                    .count(),
+            ),
+            SessionView::All => (layout.all_col, layout.all_width, "All", self.sessions.len()),
+        };
+        let focused = self.focused_view == view;
+        let marker = if focused { ">" } else { " " };
+        let line = truncate(&format!("{marker} {label} ({count})"), width);
+        write_segment_at(stdout, layout.header_row, col, &line, focused)?;
+        Ok(())
+    }
+
+    fn render_pane_row_at(
         &self,
         stdout: &mut impl Write,
+        view: SessionView,
         visible_row: usize,
         visible: Option<VisibleRow>,
     ) -> AppResult<()> {
         let layout = self.layout();
         let row = layout.list_row_start + visible_row;
-        let selected = self.top + visible_row == self.selected;
+        let selected = self.focused_view == view
+            && self.top_for_view(view) + visible_row == self.selected_for_view(view);
         let pointer = if selected { ">" } else { " " };
 
         let line = match visible {
@@ -1714,11 +2009,12 @@ impl App {
                 } else {
                     (groups::UNGROUPED_NAME, self.ungrouped_collapsed)
                 };
-                let (selected_count, count) = selected_count_for_group(
+                let (selected_count, count) = selected_count_for_group_in_view(
                     &self.sessions,
                     &self.groups,
                     &self.selected_sessions,
                     group_index,
+                    view,
                 );
                 let count_label = if selected_count > 0 {
                     format!("{selected_count}/{count}")
@@ -1740,15 +2036,12 @@ impl App {
             }
             None => String::new(),
         };
-        let line = truncate(
-            &line,
-            self.cols.saturating_sub(layout.table_col.saturating_sub(1)),
-        );
-        if line.is_empty() {
-            write_row(stdout, row, "", false)?;
-        } else {
-            write_at(stdout, row, layout.table_col, &line, selected)?;
-        }
+        let (col, width) = match view {
+            SessionView::Active => (layout.active_col, layout.active_width),
+            SessionView::All => (layout.all_col, layout.all_width),
+        };
+        let line = truncate(&line, width);
+        write_segment_at(stdout, row, col, &line, selected)?;
         Ok(())
     }
 
@@ -1786,7 +2079,7 @@ impl App {
                     format!("KILL {} sessions{suffix}? y/N", session_names.len())
                 }
                 Prompt::Action { choice } => {
-                    let actions = ["move", "pin/unpin", "kill", "clear"];
+                    let actions = ["move", "active", "kill", "clear"];
                     format!(
                         "SELECTED {} sessions: [{}]  j/k choose  Enter confirm  Esc cancel",
                         self.selected_live_session_names().len(),
@@ -1949,11 +2242,13 @@ impl App {
         if let Some(name) = selected_name {
             self.select_session_by_name(&name);
         } else {
-            self.selected = self
-                .selected
-                .min(self.visible_rows().len().saturating_sub(1));
+            self.set_selected_for_view(
+                self.focused_view,
+                self.selected_for_view(self.focused_view)
+                    .min(self.visible_rows().len().saturating_sub(1)),
+            );
         }
-        self.top = self.top.min(self.selected);
+        self.ensure_visible();
         Ok(())
     }
 }
@@ -2265,6 +2560,24 @@ fn write_at(
     Ok(())
 }
 
+fn write_segment_at(
+    stdout: &mut impl Write,
+    row: usize,
+    col: usize,
+    text: &str,
+    selected: bool,
+) -> io::Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    if selected {
+        write!(stdout, "\x1b[{};{}H\x1b[7m{text}\x1b[0m", row, col)?;
+    } else {
+        write!(stdout, "\x1b[{};{}H{text}", row, col)?;
+    }
+    Ok(())
+}
+
 fn get_termios(fd: RawFd) -> AppResult<libc::termios> {
     let mut termios = MaybeUninit::<libc::termios>::uninit();
     let rc = unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) };
@@ -2291,13 +2604,14 @@ fn main() -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, MouseEvent, NameAction, Prompt, SHORTCUTS, Session, VisibleRow, arrange_sessions,
-        build_visible_rows, bulk_pin_target_state, first_session_row_position,
-        format_relative_activity, help_popup_height, help_popup_lines, last_session_row_position,
-        mode_line, mouse_wheel_delta, move_popup_lines, next_help_index, parse_mouse_escape,
-        pinned_names_from_sessions, prune_selected_sessions, selected_count_for_group,
-        session_name_matches, session_row_line, toggle_selection_for_group,
-        toggle_selection_for_rows, visible_index_for_mouse_row, write_pinned_names,
+        App, MouseEvent, NameAction, Prompt, SHORTCUTS, Session, SessionView, VisibleRow,
+        arrange_sessions, build_visible_rows, build_visible_rows_for_view, bulk_pin_target_state,
+        first_session_row_position, format_relative_activity, help_popup_height, help_popup_lines,
+        last_session_row_position, mode_line, mouse_wheel_delta, move_popup_lines, next_help_index,
+        parse_mouse_escape, pinned_names_from_sessions, prune_selected_sessions,
+        selected_count_for_group, session_name_matches, session_row_line,
+        toggle_selection_for_group, toggle_selection_for_rows, visible_index_for_mouse_row,
+        write_pinned_names,
     };
     use crate::groups::{Group, GroupState};
     use std::collections::BTreeSet;
@@ -2326,12 +2640,18 @@ mod tests {
         let groups = GroupState::default();
         let selected =
             first_session_row_position(&build_visible_rows(&sessions, &groups, "", false));
+        let active_rows =
+            build_visible_rows_for_view(&sessions, &groups, "", false, SessionView::Active);
+        let active_selected = first_session_row_position(&active_rows);
         App {
             sessions,
             groups,
             selected_sessions: BTreeSet::new(),
             selected,
             top: 0,
+            active_selected,
+            active_top: 0,
+            focused_view: SessionView::All,
             rows: 24,
             cols: 80,
             pin_file: PathBuf::new(),
@@ -2524,6 +2844,90 @@ mod tests {
             build_visible_rows(&sessions, &groups, "", false),
             vec![VisibleRow::Group(0), VisibleRow::Session(0)]
         );
+    }
+
+    #[test]
+    fn active_view_only_contains_active_sessions_and_hides_empty_groups() {
+        let sessions = vec![
+            session("api", 0, true),
+            session("database", 0, false),
+            session("notes", 0, false),
+        ];
+        let groups = GroupState {
+            version: 1,
+            groups: vec![
+                Group {
+                    name: "Work".to_string(),
+                    collapsed: false,
+                    sessions: vec!["api".to_string(), "database".to_string()],
+                },
+                Group {
+                    name: "Personal".to_string(),
+                    collapsed: false,
+                    sessions: vec!["notes".to_string()],
+                },
+            ],
+        };
+
+        assert_eq!(
+            build_visible_rows_for_view(&sessions, &groups, "", false, SessionView::Active),
+            vec![VisibleRow::Group(0), VisibleRow::Session(0)]
+        );
+        assert_eq!(
+            build_visible_rows_for_view(&sessions, &groups, "", false, SessionView::All),
+            vec![
+                VisibleRow::Group(0),
+                VisibleRow::Session(0),
+                VisibleRow::Session(1),
+                VisibleRow::Group(1),
+                VisibleRow::Session(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn ctrl_h_l_switches_focused_view_without_losing_cursor() {
+        let mut app =
+            app_with_sessions(vec![session("api", 0, true), session("database", 0, false)]);
+
+        assert_eq!(app.focused_view, SessionView::All);
+        app.selected = 2;
+
+        app.focus_left_view();
+        assert_eq!(app.focused_view, SessionView::Active);
+        assert_eq!(app.selected_row(), Some(VisibleRow::Session(0)));
+
+        app.focus_right_view();
+        assert_eq!(app.focused_view, SessionView::All);
+        assert_eq!(app.selected_row(), Some(VisibleRow::Session(1)));
+    }
+
+    #[test]
+    fn p_adds_session_from_all_and_removes_session_from_active() {
+        let pin_file = temp_state_file("active");
+        let mut app = app_with_sessions(vec![
+            session("api", 0, false),
+            session("database", 0, false),
+        ]);
+        app.pin_file = pin_file.clone();
+        app.selected = 1;
+
+        app.toggle_pin().unwrap();
+        assert!(
+            app.sessions
+                .iter()
+                .any(|session| session.name == "api" && session.pinned)
+        );
+        assert_eq!(fs::read_to_string(&pin_file).unwrap(), "api\n");
+
+        app.focus_left_view();
+        app.toggle_pin().unwrap();
+        assert!(app.sessions.iter().all(|session| !session.pinned));
+        assert_eq!(fs::read_to_string(&pin_file).unwrap(), "\n");
+        assert_eq!(app.focused_view, SessionView::Active);
+        assert_eq!(app.selected_row(), None);
+
+        let _ = fs::remove_file(pin_file);
     }
 
     #[test]
@@ -2782,7 +3186,7 @@ mod tests {
 
     #[test]
     fn shortcut_help_popup_marks_current_entry() {
-        let lines = help_popup_lines(2, 3);
+        let lines = help_popup_lines(3, 3);
 
         assert!(lines.iter().any(|line| line.starts_with("> g/G")));
         assert!(lines.last().unwrap().contains("Esc close"));
@@ -2822,15 +3226,27 @@ mod tests {
 
     #[test]
     fn mode_line_describes_current_mode() {
-        assert!(mode_line(None, false, "", true, 0).starts_with("MODE normal"));
-        assert!(mode_line(None, false, "", true, 2).starts_with("MODE selection"));
-        assert_eq!(
-            mode_line(None, true, "api", false, 0),
-            "MODE search: /api  no matches"
+        assert!(
+            mode_line(None, false, "", true, 0, SessionView::All).starts_with("MODE normal All")
         );
         assert!(
-            mode_line(Some(&Prompt::Help { index: 0 }), false, "", true, 0)
-                .starts_with("MODE help")
+            mode_line(None, false, "", true, 2, SessionView::Active)
+                .starts_with("MODE selection Active")
+        );
+        assert_eq!(
+            mode_line(None, true, "api", false, 0, SessionView::All),
+            "MODE search All: /api  no matches"
+        );
+        assert!(
+            mode_line(
+                Some(&Prompt::Help { index: 0 }),
+                false,
+                "",
+                true,
+                0,
+                SessionView::All,
+            )
+            .starts_with("MODE help")
         );
         assert!(
             mode_line(
@@ -2842,6 +3258,7 @@ mod tests {
                 "",
                 true,
                 2,
+                SessionView::All,
             )
             .starts_with("MODE move: 2 sessions")
         );
@@ -2856,6 +3273,7 @@ mod tests {
                 "",
                 true,
                 0,
+                SessionView::All,
             ),
             "MODE input: NEW GROUP: Work_"
         );
@@ -2941,7 +3359,7 @@ mod tests {
         let activated = app
             .handle_mouse(MouseEvent {
                 button: 65,
-                col: 5,
+                col: app.layout().all_col + 5,
                 row: app.layout().list_row_start + 1,
                 pressed: true,
             })
@@ -2961,7 +3379,7 @@ mod tests {
 
         app.handle_mouse(MouseEvent {
             button: 2,
-            col: 5,
+            col: layout.all_col + 5,
             row: layout.list_row_start + 1,
             pressed: true,
         })
@@ -3021,7 +3439,7 @@ mod tests {
         let activated = app
             .handle_mouse(MouseEvent {
                 button: 0,
-                col: 10,
+                col: layout.all_col + 10,
                 row: layout.list_row_start + 2,
                 pressed: true,
             })
@@ -3039,7 +3457,7 @@ mod tests {
 
         app.handle_mouse(MouseEvent {
             button: 0,
-            col: layout.table_col + 2,
+            col: layout.all_col + 2,
             row: layout.list_row_start + 1,
             pressed: true,
         })
@@ -3054,7 +3472,7 @@ mod tests {
         let layout = app.layout();
         let click = MouseEvent {
             button: 0,
-            col: 4,
+            col: layout.all_col + 4,
             row: layout.list_row_start,
             pressed: true,
         };
@@ -3073,7 +3491,7 @@ mod tests {
 
         app.handle_mouse(MouseEvent {
             button: 0,
-            col: 4,
+            col: layout.all_col + 4,
             row: layout.list_row_start,
             pressed: true,
         })
