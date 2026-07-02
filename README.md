@@ -27,7 +27,7 @@ cargo build --release
 | `Esc` | Clear search |
 | `Enter` | Switch session, toggle group, or open selected-session actions |
 | `h` / `l` | Collapse / expand group |
-| `c` | Create a detached tmux session and select it in All |
+| `c` | Create a detached session in the current group; make it Active when focused there |
 | `n` | Create group |
 | `Space` | Toggle selected session or all sessions in a group |
 | `a` | Toggle all sessions in the current group |

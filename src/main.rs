@@ -615,7 +615,10 @@ struct App {
 #[derive(Clone)]
 enum NameAction {
     Create,
-    CreateSession,
+    CreateSession {
+        group_index: Option<usize>,
+        active: bool,
+    },
     Rename(usize),
     CreateAndMove(Vec<String>),
 }
@@ -1393,10 +1396,20 @@ impl App {
     }
 
     fn begin_create_session(&mut self) {
+        let group_index = match self.selected_row() {
+            Some(VisibleRow::Group(index)) if index < self.groups.groups.len() => Some(index),
+            Some(VisibleRow::Session(index)) => {
+                self.groups.group_for_session(&self.sessions[index].name)
+            }
+            _ => None,
+        };
         self.prompt = Some(Prompt::Name {
             label: "NEW SESSION",
             value: String::new(),
-            action: NameAction::CreateSession,
+            action: NameAction::CreateSession {
+                group_index,
+                active: self.focused_view == SessionView::Active,
+            },
         });
     }
 
@@ -1561,7 +1574,10 @@ impl App {
                 self.select_row(VisibleRow::Group(group_index));
                 self.status = format!("Created {}", self.groups.groups[group_index].name);
             }
-            NameAction::CreateSession => {
+            NameAction::CreateSession {
+                group_index,
+                active,
+            } => {
                 if value.is_empty() {
                     return Err("Session name cannot be empty".to_string());
                 }
@@ -1571,7 +1587,30 @@ impl App {
                     &["new-session", "-d", "-s", value],
                 )
                 .map_err(|err| err.to_string())?;
-                self.focused_view = SessionView::All;
+
+                self.groups.move_session(value, group_index);
+                if let Some(group) = group_index.and_then(|index| self.groups.groups.get_mut(index))
+                {
+                    group.collapsed = false;
+                    self.groups
+                        .save(&self.group_file)
+                        .map_err(|err| err.to_string())?;
+                } else {
+                    self.ungrouped_collapsed = false;
+                }
+
+                if active {
+                    let mut pinned_names = pinned_names_from_sessions(&self.sessions);
+                    pinned_names.push(value.to_string());
+                    write_pinned_names(&self.pin_file, &pinned_names)
+                        .map_err(|err| err.to_string())?;
+                }
+
+                self.focused_view = if active {
+                    SessionView::Active
+                } else {
+                    SessionView::All
+                };
                 self.query.clear();
                 self.reload_sessions(Some(value))
                     .map_err(|err| err.to_string())?;
@@ -3197,7 +3236,15 @@ mod tests {
 
     #[test]
     fn create_session_opens_an_empty_session_name_prompt() {
-        let mut app = app_with_sessions(vec![session("api", 0, false)]);
+        let mut app = app_with_sessions(vec![session("api", 0, true)]);
+        app.groups = GroupState {
+            version: 1,
+            groups: vec![Group {
+                name: "Pet".to_string(),
+                collapsed: false,
+                sessions: vec!["api".to_string()],
+            }],
+        };
 
         app.begin_create_session();
 
@@ -3206,8 +3253,39 @@ mod tests {
             Some(Prompt::Name {
                 label: "NEW SESSION",
                 ref value,
-                action: NameAction::CreateSession,
+                action: NameAction::CreateSession {
+                    group_index: Some(0),
+                    active: true,
+                },
             }) if value.is_empty()
+        ));
+    }
+
+    #[test]
+    fn create_session_from_all_inherits_group_without_becoming_active() {
+        let mut app = app_with_sessions(vec![session("api", 0, false)]);
+        app.groups = GroupState {
+            version: 1,
+            groups: vec![Group {
+                name: "Work".to_string(),
+                collapsed: false,
+                sessions: vec!["api".to_string()],
+            }],
+        };
+        app.focused_view = SessionView::All;
+        app.selected = 1;
+
+        app.begin_create_session();
+
+        assert!(matches!(
+            app.prompt,
+            Some(Prompt::Name {
+                action: NameAction::CreateSession {
+                    group_index: Some(0),
+                    active: false,
+                },
+                ..
+            })
         ));
     }
 
@@ -3222,7 +3300,7 @@ mod tests {
         assert!(matches!(
             app.prompt,
             Some(Prompt::Name {
-                action: NameAction::CreateSession,
+                action: NameAction::CreateSession { .. },
                 ..
             })
         ));
