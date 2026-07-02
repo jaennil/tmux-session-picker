@@ -1340,10 +1340,11 @@ impl App {
 
         let session_name = self.sessions[session_index].name.clone();
         let rows = self.visible_rows();
+        let selected = self.selected_for_view(self.focused_view);
         let next_selected_name = rows
             .iter()
-            .skip(self.selected + 1)
-            .chain(rows[..self.selected].iter().rev())
+            .skip(selected + 1)
+            .chain(rows[..selected].iter().rev())
             .find_map(|row| match row {
                 VisibleRow::Session(index) if *index != session_index => {
                     Some(self.sessions[*index].name.clone())

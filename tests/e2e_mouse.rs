@@ -118,6 +118,57 @@ sessions = ["current"]
 }
 
 #[test]
+fn x_kills_highlighted_session_from_active_after_all_navigation() {
+    let temp_dir = temp_dir("kill-from-active");
+    fs::create_dir_all(&temp_dir).unwrap();
+    let tmux_bin = temp_dir.join("tmux");
+    let sessions_file = temp_dir.join("sessions");
+    let switch_file = temp_dir.join("switched");
+    let killed_file = temp_dir.join("killed");
+    let pin_file = temp_dir.join("pins");
+    write_fake_tmux(&tmux_bin);
+    write_sessions(
+        &sessions_file,
+        &[
+            ("current", 400),
+            ("target", 300),
+            ("inactive-a", 200),
+            ("inactive-b", 100),
+        ],
+    );
+    fs::write(&pin_file, "current\ntarget\n").unwrap();
+
+    let (mut master, slave) = open_pty(24, 80);
+    let mut child = spawn_picker(
+        &temp_dir,
+        &sessions_file,
+        "current",
+        &switch_file,
+        &pin_file,
+        slave,
+    );
+
+    wait_for_output(&mut master, "inactive-b", Duration::from_secs(2));
+    master.write_all(b"\x0cG\x08jx").unwrap();
+    master.flush().unwrap();
+
+    let killed = wait_for_file(
+        &killed_file,
+        Duration::from_secs(2),
+        &mut master,
+        &mut child,
+    );
+    assert_eq!(killed, "target\n");
+
+    master.write_all(b"q").unwrap();
+    master.flush().unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success());
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
 fn mouse_double_click_switches_session_in_terminal() {
     let temp_dir = temp_dir("mouse");
     fs::create_dir_all(&temp_dir).unwrap();
@@ -378,6 +429,20 @@ case "$1" in
     done
     exit 1
     ;;
+  kill-session)
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "-t" ]; then
+        shift
+        printf '%s\n' "$1" > "$TMUX_E2E_KILLED_FILE"
+        awk -F '\t' -v target="$1" '$1 != target' "$TMUX_E2E_SESSIONS_FILE" \
+          > "$TMUX_E2E_SESSIONS_FILE.tmp"
+        mv "$TMUX_E2E_SESSIONS_FILE.tmp" "$TMUX_E2E_SESSIONS_FILE"
+        exit 0
+      fi
+      shift
+    done
+    exit 1
+    ;;
   *)
     exit 1
     ;;
@@ -456,6 +521,7 @@ fn spawn_picker(
         .env("TMUX_E2E_SESSIONS_FILE", sessions_file)
         .env("TMUX_E2E_SWITCH_FILE", switch_file)
         .env("TMUX_E2E_CREATED_FILE", temp_dir.join("created"))
+        .env("TMUX_E2E_KILLED_FILE", temp_dir.join("killed"))
         .env("TMUX_SESSION_PIN_FILE", pin_file)
         .env("TMUX_SESSION_GROUP_FILE", temp_dir.join("groups.toml"))
         .spawn()
