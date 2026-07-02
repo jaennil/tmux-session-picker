@@ -444,6 +444,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Esc", "clear search, cancel prompt, or quit"),
     ("Enter", "switch session, toggle group, or act on selection"),
     ("h/l", "collapse or expand group"),
+    ("c", "create session"),
     ("n", "create group"),
     ("Space", "toggle selected session or group"),
     ("a", "toggle current group selection"),
@@ -614,6 +615,7 @@ struct App {
 #[derive(Clone)]
 enum NameAction {
     Create,
+    CreateSession,
     Rename(usize),
     CreateAndMove(Vec<String>),
 }
@@ -778,6 +780,7 @@ impl App {
                     self.searching = true;
                     self.status.clear();
                 }
+                b'c' => self.begin_create_session(),
                 b'n' => self.begin_create_group(),
                 b'm' => self.begin_move_session(),
                 b'r' => self.begin_rename_group(),
@@ -1389,6 +1392,14 @@ impl App {
         });
     }
 
+    fn begin_create_session(&mut self) {
+        self.prompt = Some(Prompt::Name {
+            label: "NEW SESSION",
+            value: String::new(),
+            action: NameAction::CreateSession,
+        });
+    }
+
     fn begin_rename_group(&mut self) {
         let Some(group_index) = self.selected_group_index() else {
             self.status = "Select a group to rename it".to_string();
@@ -1431,7 +1442,7 @@ impl App {
         match &mut prompt {
             Prompt::Name { value, action, .. } => match byte {
                 b'\r' | b'\n' => {
-                    let result = self.submit_group_name(value, action.clone());
+                    let result = self.submit_name(value, action.clone());
                     if let Err(err) = result {
                         self.status = err;
                         self.prompt = Some(prompt);
@@ -1541,7 +1552,7 @@ impl App {
         Ok(())
     }
 
-    fn submit_group_name(&mut self, value: &str, action: NameAction) -> Result<(), String> {
+    fn submit_name(&mut self, value: &str, action: NameAction) -> Result<(), String> {
         match action {
             NameAction::Create => {
                 let group_index = self.groups.add_group(value)?;
@@ -1549,6 +1560,22 @@ impl App {
                 self.query.clear();
                 self.select_row(VisibleRow::Group(group_index));
                 self.status = format!("Created {}", self.groups.groups[group_index].name);
+            }
+            NameAction::CreateSession => {
+                if value.is_empty() {
+                    return Err("Session name cannot be empty".to_string());
+                }
+                tmux_output(
+                    &self.tmux_socket_name,
+                    &self.tmux_socket_path,
+                    &["new-session", "-d", "-s", value],
+                )
+                .map_err(|err| err.to_string())?;
+                self.focused_view = SessionView::All;
+                self.query.clear();
+                self.reload_sessions(Some(value))
+                    .map_err(|err| err.to_string())?;
+                self.status = format!("Created session {value}");
             }
             NameAction::Rename(group_index) => {
                 self.groups.rename_group(group_index, value)?;
@@ -3166,6 +3193,39 @@ mod tests {
 
         assert!(app.prompt.is_none());
         assert_eq!(app.status, "Cancelled");
+    }
+
+    #[test]
+    fn create_session_opens_an_empty_session_name_prompt() {
+        let mut app = app_with_sessions(vec![session("api", 0, false)]);
+
+        app.begin_create_session();
+
+        assert!(matches!(
+            app.prompt,
+            Some(Prompt::Name {
+                label: "NEW SESSION",
+                ref value,
+                action: NameAction::CreateSession,
+            }) if value.is_empty()
+        ));
+    }
+
+    #[test]
+    fn empty_session_name_keeps_prompt_open_with_error() {
+        let mut app = app_with_sessions(vec![session("api", 0, false)]);
+        app.begin_create_session();
+
+        app.handle_prompt(b'\r').unwrap();
+
+        assert_eq!(app.status, "Session name cannot be empty");
+        assert!(matches!(
+            app.prompt,
+            Some(Prompt::Name {
+                action: NameAction::CreateSession,
+                ..
+            })
+        ));
     }
 
     #[test]
