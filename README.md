@@ -43,7 +43,7 @@ cargo build --release
 | `q` | Quit |
 | Left click | Move the cursor to a session |
 | Double-click | Switch session or toggle group |
-| Left drag | Move an active session up or down |
+| Left drag | Move a session between groups, or reorder it within an Active group |
 | Right click | Add/remove the session under the cursor from Active |
 | Checkbox click | Toggle a session while selection mode is active |
 | Mouse wheel | Scroll the session list |

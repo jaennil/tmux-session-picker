@@ -459,7 +459,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("?", "show shortcuts"),
     ("Mouse", "click session; double-click activate"),
     ("Right click", "add/remove session from Active"),
-    ("Drag", "move active session up or down"),
+    ("Drag", "move between groups or reorder Active"),
     ("Wheel", "scroll sessions"),
     ("q", "quit"),
 ];
@@ -610,6 +610,7 @@ struct App {
     ungrouped_collapsed: bool,
     prompt: Option<Prompt>,
     last_click: Option<(SessionView, VisibleRow, Instant)>,
+    dragged_session: Option<String>,
 }
 
 #[derive(Clone)]
@@ -707,6 +708,7 @@ impl App {
             ungrouped_collapsed: false,
             prompt: None,
             last_click: None,
+            dragged_session: None,
         })
     }
 
@@ -821,14 +823,17 @@ impl App {
                 self.scroll_visible_rows(delta);
             }
             self.last_click = None;
+            self.dragged_session = None;
             return Ok(false);
         }
 
         if !event.pressed || self.prompt.is_some() {
+            self.dragged_session = None;
             return Ok(false);
         }
 
         if mouse_plain_button(event.button) == Some(2) {
+            self.dragged_session = None;
             return self.handle_right_click(event);
         }
         if mouse_drag_button(event.button) == Some(0) {
@@ -842,6 +847,7 @@ impl App {
 
         let Some((view, index, row)) = self.visible_mouse_row(event) else {
             self.last_click = None;
+            self.dragged_session = None;
             return Ok(false);
         };
         self.focused_view = view;
@@ -857,6 +863,7 @@ impl App {
         self.last_click = Some((view, row, now));
 
         if let VisibleRow::Group(group_index) = row {
+            self.dragged_session = None;
             if repeated {
                 self.last_click = None;
                 self.toggle_group(group_index)?;
@@ -865,6 +872,10 @@ impl App {
         }
 
         self.set_selected_for_view(view, index);
+        let VisibleRow::Session(session_index) = row else {
+            unreachable!();
+        };
+        self.dragged_session = Some(self.sessions[session_index].name.clone());
 
         let pane_col = self.pane_col(view);
         let checkbox_start = pane_col + 2;
@@ -902,12 +913,40 @@ impl App {
     }
 
     fn drag_selected_session_to_mouse_row(&mut self, event: MouseEvent) -> AppResult<()> {
-        let Some((view, target_index, VisibleRow::Session(_))) = self.visible_mouse_row(event)
-        else {
+        let Some((view, target_index, target_row)) = self.visible_mouse_row(event) else {
             return Ok(());
         };
+        let Some(session_name) = self.dragged_session.clone() else {
+            return Ok(());
+        };
+        if !self
+            .sessions
+            .iter()
+            .any(|session| session.name == session_name)
+        {
+            self.dragged_session = None;
+            return Ok(());
+        }
+        let source_group = self.groups.group_for_session(&session_name);
+        let target_group = match target_row {
+            VisibleRow::Group(index) => (index < self.groups.groups.len()).then_some(index),
+            VisibleRow::Session(index) => self.groups.group_for_session(&self.sessions[index].name),
+        };
+
         self.focused_view = view;
-        if !matches!(self.selected_row(), Some(VisibleRow::Session(_))) {
+        if source_group != target_group {
+            self.move_sessions_to(&[session_name], target_group)?;
+            return Ok(());
+        }
+
+        if !matches!(target_row, VisibleRow::Session(_)) {
+            return Ok(());
+        }
+        self.select_session_by_name(&session_name);
+        if !matches!(
+            self.selected_session_index(),
+            Some(index) if self.sessions[index].name == session_name
+        ) {
             return Ok(());
         }
 
@@ -2731,6 +2770,7 @@ mod tests {
             ungrouped_collapsed: false,
             prompt: None,
             last_click: None,
+            dragged_session: None,
         }
     }
 
@@ -3569,6 +3609,97 @@ mod tests {
         assert_eq!(names, vec!["database", "api"]);
         assert_eq!(fs::read_to_string(&pin_file).unwrap(), "database\napi\n");
         let _ = fs::remove_file(pin_file);
+    }
+
+    #[test]
+    fn left_drag_moves_session_onto_another_group_header() {
+        let group_file = temp_state_file("groups");
+        let mut app = app_with_sessions(vec![
+            session("api", 0, false),
+            session("database", 0, false),
+        ]);
+        app.groups = GroupState {
+            version: 1,
+            groups: vec![
+                Group {
+                    name: "Pet".to_string(),
+                    collapsed: false,
+                    sessions: vec!["api".to_string()],
+                },
+                Group {
+                    name: "Work".to_string(),
+                    collapsed: false,
+                    sessions: vec!["database".to_string()],
+                },
+            ],
+        };
+        app.group_file = group_file.clone();
+        app.focused_view = SessionView::All;
+        let layout = app.layout();
+
+        app.handle_mouse(MouseEvent {
+            button: 0,
+            col: layout.all_col + 5,
+            row: layout.list_row_start + 1,
+            pressed: true,
+        })
+        .unwrap();
+        app.handle_mouse(MouseEvent {
+            button: 32,
+            col: layout.all_col + 5,
+            row: layout.list_row_start + 2,
+            pressed: true,
+        })
+        .unwrap();
+
+        assert_eq!(app.groups.group_for_session("api"), Some(1));
+        assert!(fs::read_to_string(&group_file).unwrap().contains("\"api\""));
+        let _ = fs::remove_file(group_file);
+    }
+
+    #[test]
+    fn dragging_from_group_header_does_not_move_selected_session() {
+        let group_file = temp_state_file("groups");
+        let mut app = app_with_sessions(vec![
+            session("api", 0, false),
+            session("database", 0, false),
+        ]);
+        app.groups = GroupState {
+            version: 1,
+            groups: vec![
+                Group {
+                    name: "Pet".to_string(),
+                    collapsed: false,
+                    sessions: vec!["api".to_string()],
+                },
+                Group {
+                    name: "Work".to_string(),
+                    collapsed: false,
+                    sessions: vec!["database".to_string()],
+                },
+            ],
+        };
+        app.group_file = group_file.clone();
+        app.focused_view = SessionView::All;
+        let layout = app.layout();
+
+        app.handle_mouse(MouseEvent {
+            button: 0,
+            col: layout.all_col + 5,
+            row: layout.list_row_start,
+            pressed: true,
+        })
+        .unwrap();
+        app.handle_mouse(MouseEvent {
+            button: 32,
+            col: layout.all_col + 5,
+            row: layout.list_row_start + 2,
+            pressed: true,
+        })
+        .unwrap();
+
+        assert_eq!(app.groups.group_for_session("api"), Some(0));
+        let _ = fs::remove_file(group_file);
     }
 
     #[test]

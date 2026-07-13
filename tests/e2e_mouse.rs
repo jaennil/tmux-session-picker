@@ -332,6 +332,69 @@ fn left_drag_reorders_pinned_session_in_terminal() {
 }
 
 #[test]
+fn left_drag_moves_session_between_groups_in_terminal() {
+    let temp_dir = temp_dir("drag-between-groups");
+    fs::create_dir_all(&temp_dir).unwrap();
+    let tmux_bin = temp_dir.join("tmux");
+    let sessions_file = temp_dir.join("sessions");
+    let group_file = temp_dir.join("groups.toml");
+    let switch_file = temp_dir.join("switched");
+    let pin_file = temp_dir.join("pins");
+    write_fake_tmux(&tmux_bin);
+    write_sessions(&sessions_file, &[("current", 100), ("clicked", 200)]);
+    fs::write(
+        &group_file,
+        r#"version = 1
+
+[[groups]]
+name = "Pet"
+collapsed = false
+sessions = ["current"]
+
+[[groups]]
+name = "Work"
+collapsed = false
+sessions = ["clicked"]
+"#,
+    )
+    .unwrap();
+
+    let (mut master, slave) = open_pty(24, 80);
+    let mut child = spawn_picker(
+        &temp_dir,
+        &sessions_file,
+        "current",
+        &switch_file,
+        &pin_file,
+        slave,
+    );
+
+    wait_for_output(&mut master, "clicked", Duration::from_secs(2));
+    master.write_all(b"\x1b[<0;45;20M\x1b[<32;45;21M").unwrap();
+    master.flush().unwrap();
+
+    wait_for_output(&mut master, "Moved current to Work", Duration::from_secs(2));
+    let group_contents = fs::read_to_string(&group_file).unwrap();
+    let group_state = toml::from_str::<toml::Value>(&group_contents).unwrap();
+    let groups = group_state["groups"].as_array().unwrap();
+    assert!(groups[0]["sessions"].as_array().unwrap().is_empty());
+    let work_sessions = groups[1]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(work_sessions, vec!["clicked", "current"]);
+
+    master.write_all(b"q").unwrap();
+    master.flush().unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success());
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
 fn ctrl_j_selects_collapsed_group_for_expansion() {
     let temp_dir = temp_dir("ctrl-group");
     fs::create_dir_all(&temp_dir).unwrap();
