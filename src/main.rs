@@ -128,6 +128,14 @@ fn mouse_drag_button(button: u16) -> Option<u16> {
         .then_some(button & MOUSE_BUTTON_MASK)
 }
 
+fn group_navigation_offset(key: u8) -> Option<isize> {
+    match key {
+        b'{' => Some(-1),
+        b'}' => Some(1),
+        _ => None,
+    }
+}
+
 fn visible_index_for_mouse_row(
     mouse_row: usize,
     list_row_start: usize,
@@ -438,6 +446,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("j/k", "move cursor"),
     ("Ctrl+h/l", "switch Active/All view"),
     ("Ctrl+j/k", "move between folders"),
+    ("{/}", "previous/next folder"),
     ("g/G", "jump first/last"),
     ("/", "search sessions and groups"),
     ("Backspace", "delete search character"),
@@ -802,6 +811,8 @@ impl App {
                 b'?' => self.show_help(),
                 b'J' => self.reorder_down()?,
                 b'K' => self.reorder_up()?,
+                value if group_navigation_offset(value) == Some(-1) => self.move_group_up(),
+                value if group_navigation_offset(value) == Some(1) => self.move_group_down(),
                 b'\r' if self.activate_selected()? => break,
                 b'\r' => {}
                 b'q' | 0x1b | 0x03 => break,
@@ -2785,10 +2796,11 @@ mod tests {
     use super::{
         App, MouseEvent, NameAction, Prompt, SHORTCUTS, Session, SessionView, VisibleRow,
         arrange_sessions, build_visible_rows, build_visible_rows_for_view, bulk_pin_target_state,
-        first_session_row_position, format_relative_activity, help_popup_height, help_popup_lines,
-        last_session_row_position, mode_line, mouse_wheel_delta, move_popup_lines, next_help_index,
-        parse_mouse_escape, pinned_names_from_sessions, place_session_in_group,
-        prune_selected_sessions, selected_count_for_group, session_name_matches, session_row_line,
+        first_session_row_position, format_relative_activity, group_navigation_offset,
+        help_popup_height, help_popup_lines, last_session_row_position, mode_line,
+        mouse_wheel_delta, move_popup_lines, next_help_index, parse_mouse_escape,
+        pinned_names_from_sessions, place_session_in_group, prune_selected_sessions,
+        selected_count_for_group, session_name_matches, session_row_line,
         toggle_selection_for_group, toggle_selection_for_rows, visible_index_for_mouse_row,
         write_pinned_names,
     };
@@ -3185,6 +3197,13 @@ mod tests {
     }
 
     #[test]
+    fn braces_map_to_previous_and_next_group_navigation() {
+        assert_eq!(group_navigation_offset(b'{'), Some(-1));
+        assert_eq!(group_navigation_offset(b'}'), Some(1));
+        assert_eq!(group_navigation_offset(b'j'), None);
+    }
+
+    #[test]
     fn selected_group_can_expand_collapsed_folder() {
         let mut app = app_with_sessions(vec![session("api", 0, false)]);
         app.ungrouped_collapsed = true;
@@ -3487,7 +3506,8 @@ mod tests {
 
     #[test]
     fn shortcut_help_popup_marks_current_entry() {
-        let lines = help_popup_lines(3, 3);
+        let index = SHORTCUTS.iter().position(|(key, _)| *key == "g/G").unwrap();
+        let lines = help_popup_lines(index, 3);
 
         assert!(lines.iter().any(|line| line.starts_with("> g/G")));
         assert!(lines.last().unwrap().contains("Esc close"));

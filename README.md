@@ -21,6 +21,7 @@ cargo build --release
 | `j` / `k` | Move selection |
 | `Ctrl+h` / `Ctrl+l` | Switch focus between Active and All views |
 | `Ctrl+j` / `Ctrl+k` | Move between group headers |
+| `{` / `}` | Move to the previous / next group |
 | `g` / `G` | Jump to first / last session |
 | `/` | Search sessions and groups by name |
 | `Backspace` | Remove the last search character |

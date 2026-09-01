@@ -453,7 +453,7 @@ sessions = ["clicked"]
 }
 
 #[test]
-fn ctrl_j_selects_collapsed_group_for_expansion() {
+fn right_brace_selects_collapsed_group_for_expansion() {
     let temp_dir = temp_dir("ctrl-group");
     fs::create_dir_all(&temp_dir).unwrap();
     let tmux_bin = temp_dir.join("tmux");
@@ -491,7 +491,7 @@ sessions = ["clicked"]
     );
 
     wait_for_output(&mut master, "Personal", Duration::from_secs(2));
-    master.write_all(b"\x0c\n\r").unwrap();
+    master.write_all(b"\x0c}\r").unwrap();
     master.flush().unwrap();
     wait_for_output(&mut master, "clicked", Duration::from_secs(2));
 
