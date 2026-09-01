@@ -517,7 +517,20 @@ fn write_fake_tmux(path: &Path) {
         r#"#!/bin/sh
 case "$1" in
   display-message)
-    printf '%s\n' "$TMUX_E2E_CURRENT_SESSION"
+    targeted=false
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "-t" ]; then
+        shift
+        [ "$1" = "$TMUX_E2E_PANE" ] || exit 1
+        targeted=true
+      fi
+      shift
+    done
+    if [ "$targeted" = true ] || [ ! -f "$TMUX_E2E_CREATED_FILE" ]; then
+      printf '%s\n' "$TMUX_E2E_CURRENT_SESSION"
+    else
+      cat "$TMUX_E2E_CREATED_FILE"
+    fi
     ;;
   list-sessions)
     cat "$TMUX_E2E_SESSIONS_FILE"
@@ -639,6 +652,8 @@ fn spawn_picker(
         .env("PATH", path)
         .env("HOME", temp_dir)
         .env("TMUX_E2E_CURRENT_SESSION", current_session)
+        .env("TMUX_E2E_PANE", "%1")
+        .env("TMUX_PANE", "%1")
         .env("TMUX_E2E_SESSIONS_FILE", sessions_file)
         .env("TMUX_E2E_SWITCH_FILE", switch_file)
         .env("TMUX_E2E_CREATED_FILE", temp_dir.join("created"))

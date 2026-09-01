@@ -2445,9 +2445,17 @@ fn load_sessions(
     socket_path: &Option<String>,
 ) -> AppResult<Vec<Session>> {
     let pinned_names = read_pinned_names(pin_file);
-    let current_session = tmux_output(socket_name, socket_path, &["display-message", "-p", "#S"])?
-        .trim()
-        .to_string();
+    let current_session = if let Ok(pane) = env::var("TMUX_PANE") {
+        tmux_output(
+            socket_name,
+            socket_path,
+            &["display-message", "-p", "-t", &pane, "#S"],
+        )?
+    } else {
+        tmux_output(socket_name, socket_path, &["display-message", "-p", "#S"])?
+    }
+    .trim()
+    .to_string();
     let raw_sessions = tmux_output(
         socket_name,
         socket_path,
