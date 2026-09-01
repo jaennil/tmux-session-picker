@@ -1663,6 +1663,7 @@ impl App {
                 } else {
                     SessionView::All
                 };
+                self.selected_sessions.clear();
                 self.query.clear();
                 self.reload_sessions(Some(value))
                     .map_err(|err| err.to_string())?;

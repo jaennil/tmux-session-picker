@@ -60,6 +60,47 @@ fn keyboard_creates_session_and_shows_it_in_all_view() {
 }
 
 #[test]
+fn freshly_created_session_can_be_killed_from_all_view() {
+    let temp_dir = temp_dir("create-kill-all");
+    fs::create_dir_all(&temp_dir).unwrap();
+    let tmux_bin = temp_dir.join("tmux");
+    let sessions_file = temp_dir.join("sessions");
+    let switch_file = temp_dir.join("switched");
+    let pin_file = temp_dir.join("pins");
+    write_fake_tmux(&tmux_bin);
+    write_sessions(&sessions_file, &[("current", 100), ("next", 90)]);
+
+    let (mut master, slave) = open_pty(24, 80);
+    let mut child = spawn_picker(
+        &temp_dir,
+        &sessions_file,
+        "current",
+        &switch_file,
+        &pin_file,
+        slave,
+    );
+
+    wait_for_output(&mut master, "next", Duration::from_secs(2));
+    master.write_all(b"\x0c cwork\rx").unwrap();
+    master.flush().unwrap();
+
+    let killed = wait_for_file(
+        &temp_dir.join("killed"),
+        Duration::from_secs(2),
+        &mut master,
+        &mut child,
+    );
+    assert_eq!(killed, "work\n");
+
+    master.write_all(b"q").unwrap();
+    master.flush().unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success());
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
 fn session_created_from_active_inherits_group_and_active_state() {
     let temp_dir = temp_dir("create-grouped-active-session");
     fs::create_dir_all(&temp_dir).unwrap();
@@ -115,6 +156,16 @@ sessions = ["current", "next"]
     wait_for_output(&mut master, "work", Duration::from_secs(2));
     let groups = fs::read_to_string(&group_file).unwrap();
     assert!(groups.contains("\"work\""), "group state was {groups:?}");
+
+    master.write_all(b"x").unwrap();
+    master.flush().unwrap();
+    let killed = wait_for_file(
+        &temp_dir.join("killed"),
+        Duration::from_secs(2),
+        &mut master,
+        &mut child,
+    );
+    assert_eq!(killed, "work\n");
 
     master.write_all(b"q").unwrap();
     master.flush().unwrap();
