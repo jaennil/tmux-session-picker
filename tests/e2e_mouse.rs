@@ -19,7 +19,7 @@ fn keyboard_creates_session_and_shows_it_in_all_view() {
     let created_file = temp_dir.join("created");
     let pin_file = temp_dir.join("pins");
     write_fake_tmux(&tmux_bin);
-    write_sessions(&sessions_file, &[("current", 100)]);
+    write_sessions(&sessions_file, &[("current", 100), ("next", 90)]);
 
     let (mut master, slave) = open_pty(24, 80);
     let mut child = spawn_picker(
@@ -44,8 +44,15 @@ fn keyboard_creates_session_and_shows_it_in_all_view() {
     );
     wait_for_output(&mut master, "work", Duration::from_secs(2));
 
-    master.write_all(b"q").unwrap();
+    master.write_all(b"k\r").unwrap();
     master.flush().unwrap();
+    let switched = wait_for_file(
+        &switch_file,
+        Duration::from_secs(2),
+        &mut master,
+        &mut child,
+    );
+    assert_eq!(switched, "current\n");
     let status = child.wait().unwrap();
     assert!(status.success());
 
@@ -63,8 +70,8 @@ fn session_created_from_active_inherits_group_and_active_state() {
     let pin_file = temp_dir.join("pins");
     let group_file = temp_dir.join("groups.toml");
     write_fake_tmux(&tmux_bin);
-    write_sessions(&sessions_file, &[("current", 100)]);
-    fs::write(&pin_file, "current\n").unwrap();
+    write_sessions(&sessions_file, &[("current", 100), ("next", 90)]);
+    fs::write(&pin_file, "current\nnext\n").unwrap();
     fs::write(
         &group_file,
         r#"version = 1
@@ -72,7 +79,7 @@ fn session_created_from_active_inherits_group_and_active_state() {
 [[groups]]
 name = "Pet"
 collapsed = false
-sessions = ["current"]
+sessions = ["current", "next"]
 "#,
     )
     .unwrap();
@@ -100,7 +107,7 @@ sessions = ["current"]
     );
     wait_for_file_contents(
         &pin_file,
-        "current\nwork\n",
+        "current\nwork\nnext\n",
         Duration::from_secs(2),
         &mut master,
         &mut child,

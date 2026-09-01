@@ -444,7 +444,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Esc", "clear search, cancel prompt, or quit"),
     ("Enter", "switch session, toggle group, or act on selection"),
     ("h/l", "collapse or expand group"),
-    ("c", "create session"),
+    ("c", "create session below cursor"),
     ("n", "create group"),
     ("Space", "toggle selected session or group"),
     ("a", "toggle current group selection"),
@@ -619,6 +619,7 @@ enum NameAction {
     CreateSession {
         group_index: Option<usize>,
         active: bool,
+        after_session: Option<String>,
     },
     Rename(usize),
     CreateAndMove(Vec<String>),
@@ -1436,12 +1437,15 @@ impl App {
     }
 
     fn begin_create_session(&mut self) {
-        let group_index = match self.selected_row() {
-            Some(VisibleRow::Group(index)) if index < self.groups.groups.len() => Some(index),
-            Some(VisibleRow::Session(index)) => {
-                self.groups.group_for_session(&self.sessions[index].name)
+        let (group_index, after_session) = match self.selected_row() {
+            Some(VisibleRow::Group(index)) if index < self.groups.groups.len() => {
+                (Some(index), None)
             }
-            _ => None,
+            Some(VisibleRow::Session(index)) => (
+                self.groups.group_for_session(&self.sessions[index].name),
+                Some(self.sessions[index].name.clone()),
+            ),
+            _ => (None, None),
         };
         self.prompt = Some(Prompt::Name {
             label: "NEW SESSION",
@@ -1449,6 +1453,7 @@ impl App {
             action: NameAction::CreateSession {
                 group_index,
                 active: self.focused_view == SessionView::Active,
+                after_session,
             },
         });
     }
@@ -1617,6 +1622,7 @@ impl App {
             NameAction::CreateSession {
                 group_index,
                 active,
+                after_session,
             } => {
                 if value.is_empty() {
                     return Err("Session name cannot be empty".to_string());
@@ -1641,7 +1647,13 @@ impl App {
 
                 if active {
                     let mut pinned_names = pinned_names_from_sessions(&self.sessions);
-                    pinned_names.push(value.to_string());
+                    place_name_in_group(
+                        &mut pinned_names,
+                        &self.groups,
+                        value,
+                        group_index,
+                        after_session.as_deref(),
+                    );
                     write_pinned_names(&self.pin_file, &pinned_names)
                         .map_err(|err| err.to_string())?;
                 }
@@ -1654,6 +1666,15 @@ impl App {
                 self.query.clear();
                 self.reload_sessions(Some(value))
                     .map_err(|err| err.to_string())?;
+                place_session_in_group(
+                    &mut self.sessions,
+                    &self.groups,
+                    value,
+                    group_index,
+                    after_session.as_deref(),
+                );
+                self.select_session_by_name(value);
+                self.ensure_visible();
                 self.status = format!("Created session {value}");
             }
             NameAction::Rename(group_index) => {
@@ -2554,6 +2575,49 @@ fn pinned_names_from_sessions(sessions: &[Session]) -> Vec<String> {
         .collect()
 }
 
+fn place_name_in_group(
+    names: &mut Vec<String>,
+    groups: &GroupState,
+    name: &str,
+    group_index: Option<usize>,
+    after_session: Option<&str>,
+) {
+    names.retain(|existing| existing != name);
+    let insertion_index = after_session
+        .and_then(|anchor| names.iter().position(|existing| existing == anchor))
+        .map(|index| index + 1)
+        .or_else(|| {
+            names
+                .iter()
+                .position(|existing| groups.group_for_session(existing) == group_index)
+        })
+        .unwrap_or(names.len());
+    names.insert(insertion_index, name.to_string());
+}
+
+fn place_session_in_group(
+    sessions: &mut Vec<Session>,
+    groups: &GroupState,
+    name: &str,
+    group_index: Option<usize>,
+    after_session: Option<&str>,
+) {
+    let Some(session_index) = sessions.iter().position(|session| session.name == name) else {
+        return;
+    };
+    let session = sessions.remove(session_index);
+    let insertion_index = after_session
+        .and_then(|anchor| sessions.iter().position(|session| session.name == anchor))
+        .map(|index| index + 1)
+        .or_else(|| {
+            sessions
+                .iter()
+                .position(|session| groups.group_for_session(&session.name) == group_index)
+        })
+        .unwrap_or(sessions.len());
+    sessions.insert(insertion_index, session);
+}
+
 fn arrange_sessions(sessions: &mut Vec<Session>, pinned_names: &[String]) {
     let mut remaining = std::mem::take(sessions);
     let mut pinned = Vec::with_capacity(remaining.len());
@@ -2714,8 +2778,8 @@ mod tests {
         arrange_sessions, build_visible_rows, build_visible_rows_for_view, bulk_pin_target_state,
         first_session_row_position, format_relative_activity, help_popup_height, help_popup_lines,
         last_session_row_position, mode_line, mouse_wheel_delta, move_popup_lines, next_help_index,
-        parse_mouse_escape, pinned_names_from_sessions, prune_selected_sessions,
-        selected_count_for_group, session_name_matches, session_row_line,
+        parse_mouse_escape, pinned_names_from_sessions, place_session_in_group,
+        prune_selected_sessions, selected_count_for_group, session_name_matches, session_row_line,
         toggle_selection_for_group, toggle_selection_for_rows, visible_index_for_mouse_row,
         write_pinned_names,
     };
@@ -3297,8 +3361,9 @@ mod tests {
                 action: NameAction::CreateSession {
                     group_index: Some(0),
                     active: true,
+                    after_session: Some(ref name),
                 },
-            }) if value.is_empty()
+            }) if value.is_empty() && name == "api"
         ));
     }
 
@@ -3324,10 +3389,54 @@ mod tests {
                 action: NameAction::CreateSession {
                     group_index: Some(0),
                     active: false,
+                    after_session: Some(ref name),
                 },
                 ..
-            })
+            }) if name == "api"
         ));
+    }
+
+    #[test]
+    fn newly_created_session_is_placed_after_cursor() {
+        let mut sessions = vec![
+            session("new", 300, false),
+            session("cursor", 200, false),
+            session("next", 100, false),
+        ];
+        let groups = GroupState::default();
+
+        place_session_in_group(&mut sessions, &groups, "new", None, Some("cursor"));
+
+        let names = sessions
+            .iter()
+            .map(|session| session.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["cursor", "new", "next"]);
+    }
+
+    #[test]
+    fn session_created_on_group_header_is_placed_first() {
+        let mut sessions = vec![
+            session("api", 200, false),
+            session("database", 100, false),
+            session("new", 300, false),
+        ];
+        let groups = GroupState {
+            version: 1,
+            groups: vec![Group {
+                name: "Work".to_string(),
+                collapsed: false,
+                sessions: vec!["new".to_string(), "api".to_string(), "database".to_string()],
+            }],
+        };
+
+        place_session_in_group(&mut sessions, &groups, "new", Some(0), None);
+
+        let names = sessions
+            .iter()
+            .map(|session| session.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["new", "api", "database"]);
     }
 
     #[test]
