@@ -18,6 +18,8 @@ const MOUSE_BUTTON_MASK: u16 = 0b11;
 const MOUSE_DRAG_FLAG: u16 = 0b10_0000;
 const MOUSE_WHEEL_FLAG: u16 = 0b100_0000;
 const MOUSE_WHEEL_ROWS: isize = 3;
+const CLAUDE_MARKER: &str = "\u{2733}";
+const CLAUDE_COMMAND: &str = "claude";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Session {
@@ -25,6 +27,7 @@ struct Session {
     last_activity: u64,
     pinned: bool,
     is_current: bool,
+    has_claude: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -570,12 +573,17 @@ fn session_row_line(
     activity_width: usize,
 ) -> String {
     let active = if session.pinned { "A" } else { " " };
+    let claude = if session.has_claude {
+        CLAUDE_MARKER
+    } else {
+        " "
+    };
     let current = if session.is_current { "*" } else { "" };
     let last = format_relative_activity(session.last_activity);
 
     if selected_sessions.is_empty() {
         return format!(
-            "{pointer}   {:<name_width$}  {:>activity_width$}  {:^3} {active}",
+            "{pointer}   {:<name_width$}  {:>activity_width$}  {:^3} {active} {claude}",
             session.name, last, current,
         );
     }
@@ -586,7 +594,7 @@ fn session_row_line(
         "[ ]"
     };
     format!(
-        "{pointer} {checkbox} {:<name_width$}  {:>activity_width$}  {:^3} {active}",
+        "{pointer} {checkbox} {:<name_width$}  {:>activity_width$}  {:^3} {active} {claude}",
         session.name, last, current,
     )
 }
@@ -2010,7 +2018,7 @@ impl App {
         let pane_width = active_width.min(all_width).max(1);
         let min_name_width = 8;
         let activity_width = 4;
-        let fixed_width = 18;
+        let fixed_width = 20;
         let max_name_width = self
             .cols
             .min(pane_width)
@@ -2476,8 +2484,25 @@ fn load_sessions(
             "#{session_name}\t#{session_activity}",
         ],
     )?;
+    let raw_panes = tmux_output(
+        socket_name,
+        socket_path,
+        &[
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}\t#{pane_current_command}",
+        ],
+    )
+    .unwrap_or_default();
+    let claude_sessions = parse_claude_sessions(&raw_panes);
 
-    let mut sessions = parse_sessions(&raw_sessions, &current_session, &pinned_names)?;
+    let mut sessions = parse_sessions(
+        &raw_sessions,
+        &current_session,
+        &pinned_names,
+        &claude_sessions,
+    )?;
     arrange_sessions(&mut sessions, &pinned_names);
     write_pinned_names(pin_file, &pinned_names_from_sessions(&sessions))?;
     Ok(sessions)
@@ -2528,10 +2553,30 @@ fn tmux_status(
     Ok(())
 }
 
+fn parse_claude_sessions(raw: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+
+    for line in raw.lines() {
+        let Some((name, command)) = line.split_once('\t') else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let command = command.rsplit('/').next().unwrap_or(command).trim();
+        if command == CLAUDE_COMMAND {
+            names.insert(name.to_string());
+        }
+    }
+
+    names
+}
+
 fn parse_sessions(
     raw: &str,
     current_session: &str,
     pinned_names: &[String],
+    claude_sessions: &BTreeSet<String>,
 ) -> AppResult<Vec<Session>> {
     let mut sessions = Vec::new();
 
@@ -2553,6 +2598,7 @@ fn parse_sessions(
             last_activity,
             pinned: pinned_names.iter().any(|pinned_name| pinned_name == &name),
             is_current: name == current_session,
+            has_claude: claude_sessions.contains(&name),
         });
     }
 
@@ -2794,13 +2840,13 @@ fn main() -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, MouseEvent, NameAction, Prompt, SHORTCUTS, Session, SessionView, VisibleRow,
-        arrange_sessions, build_visible_rows, build_visible_rows_for_view, bulk_pin_target_state,
-        first_session_row_position, format_relative_activity, group_navigation_offset,
-        help_popup_height, help_popup_lines, last_session_row_position, mode_line,
-        mouse_wheel_delta, move_popup_lines, next_help_index, parse_mouse_escape,
-        pinned_names_from_sessions, place_session_in_group, prune_selected_sessions,
-        selected_count_for_group, session_name_matches, session_row_line,
+        App, CLAUDE_MARKER, MouseEvent, NameAction, Prompt, SHORTCUTS, Session, SessionView,
+        VisibleRow, arrange_sessions, build_visible_rows, build_visible_rows_for_view,
+        bulk_pin_target_state, first_session_row_position, format_relative_activity,
+        group_navigation_offset, help_popup_height, help_popup_lines, last_session_row_position,
+        mode_line, mouse_wheel_delta, move_popup_lines, next_help_index, parse_claude_sessions,
+        parse_mouse_escape, pinned_names_from_sessions, place_session_in_group,
+        prune_selected_sessions, selected_count_for_group, session_name_matches, session_row_line,
         toggle_selection_for_group, toggle_selection_for_rows, visible_index_for_mouse_row,
         write_pinned_names,
     };
@@ -2816,6 +2862,7 @@ mod tests {
             last_activity,
             pinned,
             is_current: false,
+            has_claude: false,
         }
     }
 
@@ -3615,6 +3662,45 @@ mod tests {
         let db = session("db", 0, false);
         let unselected_line = session_row_line(" ", &db, &selected, 16, 4);
         assert!(unselected_line.contains("[ ]"));
+    }
+
+    #[test]
+    fn session_row_marks_sessions_running_claude() {
+        let mut api = session("api", 0, false);
+        assert!(!session_row_line(">", &api, &BTreeSet::new(), 16, 4).contains(CLAUDE_MARKER));
+
+        api.has_claude = true;
+        let marked = session_row_line(">", &api, &BTreeSet::new(), 16, 4);
+        assert!(marked.contains(CLAUDE_MARKER));
+
+        let selected = BTreeSet::from(["api".to_string()]);
+        assert!(session_row_line(">", &api, &selected, 16, 4).contains(CLAUDE_MARKER));
+    }
+
+    #[test]
+    fn claude_panes_are_collected_per_session() {
+        let raw = concat!(
+            "api\tfish\n",
+            "api\tclaude\n",
+            "db\tnvim\n",
+            "web\t/usr/local/bin/claude\n",
+            "\tclaude\n",
+            "broken-line\n",
+        );
+
+        let claude_sessions = parse_claude_sessions(raw);
+
+        assert!(claude_sessions.contains("api"));
+        assert!(claude_sessions.contains("web"));
+        assert!(!claude_sessions.contains("db"));
+        assert_eq!(claude_sessions.len(), 2);
+    }
+
+    #[test]
+    fn claude_panes_ignore_unrelated_commands() {
+        let raw = concat!("api\tclaude-code\n", "db\tnotclaude\n");
+
+        assert!(parse_claude_sessions(raw).is_empty());
     }
 
     #[test]
