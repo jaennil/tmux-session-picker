@@ -10,13 +10,16 @@ into named, collapsible groups. Group membership and collapse state are stored i
 
 ## Indicators
 
-Each session row ends with three markers:
+Each session row ends with markers:
 
 | Marker | Meaning |
 | --- | --- |
 | `*` | The session you are currently attached to |
-| `A` | The session is in the Active view |
+| `A` | The session is in the Active view (shown in the All view only) |
 | `✳` | The session has a pane running `claude` |
+
+The `A` marker is omitted in the Active view, where every row is active by
+definition.
 
 ## Build
 

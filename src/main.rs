@@ -565,25 +565,39 @@ fn mode_line(
     }
 }
 
+fn session_markers(session: &Session, view: SessionView) -> String {
+    let claude = if session.has_claude {
+        CLAUDE_MARKER
+    } else {
+        " "
+    };
+
+    // Every row in the Active view is active, so the marker only earns its
+    // column in the All view.
+    match view {
+        SessionView::Active => claude.to_string(),
+        SessionView::All => {
+            let active = if session.pinned { "A" } else { " " };
+            format!("{active} {claude}")
+        }
+    }
+}
+
 fn session_row_line(
     pointer: &str,
     session: &Session,
     selected_sessions: &BTreeSet<String>,
     name_width: usize,
     activity_width: usize,
+    view: SessionView,
 ) -> String {
-    let active = if session.pinned { "A" } else { " " };
-    let claude = if session.has_claude {
-        CLAUDE_MARKER
-    } else {
-        " "
-    };
+    let markers = session_markers(session, view);
     let current = if session.is_current { "*" } else { "" };
     let last = format_relative_activity(session.last_activity);
 
     if selected_sessions.is_empty() {
         return format!(
-            "{pointer}   {:<name_width$}  {:>activity_width$}  {:^3} {active} {claude}",
+            "{pointer}   {:<name_width$}  {:>activity_width$}  {:^3} {markers}",
             session.name, last, current,
         );
     }
@@ -594,7 +608,7 @@ fn session_row_line(
         "[ ]"
     };
     format!(
-        "{pointer} {checkbox} {:<name_width$}  {:>activity_width$}  {:^3} {active} {claude}",
+        "{pointer} {checkbox} {:<name_width$}  {:>activity_width$}  {:^3} {markers}",
         session.name, last, current,
     )
 }
@@ -2179,6 +2193,7 @@ impl App {
                     &self.selected_sessions,
                     layout.name_width,
                     layout.activity_width,
+                    view,
                 )
             }
             None => String::new(),
@@ -2846,9 +2861,9 @@ mod tests {
         group_navigation_offset, help_popup_height, help_popup_lines, last_session_row_position,
         mode_line, mouse_wheel_delta, move_popup_lines, next_help_index, parse_claude_sessions,
         parse_mouse_escape, pinned_names_from_sessions, place_session_in_group,
-        prune_selected_sessions, selected_count_for_group, session_name_matches, session_row_line,
-        toggle_selection_for_group, toggle_selection_for_rows, visible_index_for_mouse_row,
-        write_pinned_names,
+        prune_selected_sessions, selected_count_for_group, session_markers, session_name_matches,
+        session_row_line, toggle_selection_for_group, toggle_selection_for_rows,
+        visible_index_for_mouse_row, write_pinned_names,
     };
     use crate::groups::{Group, GroupState};
     use std::collections::BTreeSet;
@@ -3651,30 +3666,54 @@ mod tests {
     fn session_row_hides_checkbox_until_selection_mode() {
         let api = session("api", 0, false);
 
-        let normal = session_row_line(">", &api, &BTreeSet::new(), 16, 4);
+        let normal = session_row_line(">", &api, &BTreeSet::new(), 16, 4, SessionView::All);
         assert!(!normal.contains("[ ]"));
         assert!(!normal.contains("[x]"));
 
         let selected = BTreeSet::from(["api".to_string()]);
-        let selected_line = session_row_line(">", &api, &selected, 16, 4);
+        let selected_line = session_row_line(">", &api, &selected, 16, 4, SessionView::All);
         assert!(selected_line.contains("[x]"));
 
         let db = session("db", 0, false);
-        let unselected_line = session_row_line(" ", &db, &selected, 16, 4);
+        let unselected_line = session_row_line(" ", &db, &selected, 16, 4, SessionView::All);
         assert!(unselected_line.contains("[ ]"));
     }
 
     #[test]
     fn session_row_marks_sessions_running_claude() {
         let mut api = session("api", 0, false);
-        assert!(!session_row_line(">", &api, &BTreeSet::new(), 16, 4).contains(CLAUDE_MARKER));
+        let plain = session_row_line(">", &api, &BTreeSet::new(), 16, 4, SessionView::All);
+        assert!(!plain.contains(CLAUDE_MARKER));
 
         api.has_claude = true;
-        let marked = session_row_line(">", &api, &BTreeSet::new(), 16, 4);
+        let marked = session_row_line(">", &api, &BTreeSet::new(), 16, 4, SessionView::All);
         assert!(marked.contains(CLAUDE_MARKER));
 
         let selected = BTreeSet::from(["api".to_string()]);
-        assert!(session_row_line(">", &api, &selected, 16, 4).contains(CLAUDE_MARKER));
+        let selected_line = session_row_line(">", &api, &selected, 16, 4, SessionView::All);
+        assert!(selected_line.contains(CLAUDE_MARKER));
+    }
+
+    #[test]
+    fn active_view_rows_omit_the_active_marker() {
+        let api = session("api", 0, true);
+
+        let active_markers = session_markers(&api, SessionView::Active);
+        assert!(!active_markers.contains('A'));
+        assert!(session_markers(&api, SessionView::All).contains('A'));
+
+        let active_row = session_row_line(">", &api, &BTreeSet::new(), 16, 4, SessionView::Active);
+        assert!(!active_row.contains('A'));
+    }
+
+    #[test]
+    fn active_view_rows_still_mark_claude() {
+        let mut api = session("api", 0, true);
+        api.has_claude = true;
+
+        let row = session_row_line(">", &api, &BTreeSet::new(), 16, 4, SessionView::Active);
+        assert!(row.contains(CLAUDE_MARKER));
+        assert!(!row.contains('A'));
     }
 
     #[test]
