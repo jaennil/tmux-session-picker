@@ -8,6 +8,16 @@ session. The picker starts focused on `Active`. Sessions can also be organized
 into named, collapsible groups. Group membership and collapse state are stored in
 `~/.config/tmux/session-groups.toml`.
 
+## Indicators
+
+Each session row ends with three markers:
+
+| Marker | Meaning |
+| --- | --- |
+| `*` | The session you are currently attached to |
+| `A` | The session is in the Active view |
+| `✳` | The session has a pane running `claude` |
+
 ## Build
 
 ```bash
